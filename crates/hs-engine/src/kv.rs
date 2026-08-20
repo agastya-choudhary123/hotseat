@@ -135,24 +135,37 @@ impl KvSpec {
     /// each plane; with `HeadMajor` it is `n_kv_heads` strided slices, which is
     /// why the two layouts do not cost the same to move.
     pub fn live_ranges(&self, n_pos: usize) -> Vec<(usize, usize)> {
+        self.live_ranges_between(0, n_pos)
+    }
+
+    /// Byte ranges covering positions `from..to`.
+    ///
+    /// A migration uses this to stop re-sending positions it has already
+    /// handed over. That is sound only because a KV cache is append-only —
+    /// each (layer, position) slot is written exactly once and never revisited
+    /// — so a page that is dirty again can only be dirty because of a position
+    /// at or after the low-water mark. A cache that compacted, evicted or slid
+    /// a window would break that, and would have to send the full live set
+    /// every round.
+    pub fn live_ranges_between(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
-        if n_pos == 0 {
+        if to <= from {
             return out;
         }
+        let n = to - from;
         for layer in 0..self.n_layers {
             for &is_v in &[false, true] {
                 let plane_off =
                     (layer * self.layer_stride() + if is_v { self.plane() } else { 0 }) * 4;
                 match self.layout {
                     KvLayout::TokenMajor => {
-                        out.push((plane_off, n_pos * self.n_kv_heads * self.head_dim * 4));
+                        let w = self.n_kv_heads * self.head_dim * 4;
+                        out.push((plane_off + from * w, n * w));
                     }
                     KvLayout::HeadMajor => {
+                        let w = self.head_dim * 4;
                         for h in 0..self.n_kv_heads {
-                            out.push((
-                                plane_off + h * self.max_ctx * self.head_dim * 4,
-                                n_pos * self.head_dim * 4,
-                            ));
+                            out.push((plane_off + (h * self.max_ctx + from) * w, n * w));
                         }
                     }
                 }
@@ -355,6 +368,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn live_ranges_between_is_a_suffix_of_live_ranges() {
+        for layout in [KvLayout::TokenMajor, KvLayout::HeadMajor] {
+            let s = spec(layout);
+            let full = s.live_ranges(10);
+            let head = s.live_ranges_between(0, 4);
+            let tail = s.live_ranges_between(4, 10);
+            assert_eq!(full.len(), head.len());
+            assert_eq!(full.len(), tail.len());
+            for i in 0..full.len() {
+                // head and tail must partition the full range exactly.
+                assert_eq!(head[i].0, full[i].0, "{}", layout.name());
+                assert_eq!(head[i].0 + head[i].1, tail[i].0, "{}", layout.name());
+                assert_eq!(tail[i].0 + tail[i].1, full[i].0 + full[i].1, "{}", layout.name());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_degenerate_intervals_are_empty() {
+        let s = spec(KvLayout::TokenMajor);
+        assert!(s.live_ranges_between(5, 5).is_empty());
+        assert!(s.live_ranges_between(9, 3).is_empty());
+        assert!(s.live_ranges(0).is_empty());
     }
 
     #[test]

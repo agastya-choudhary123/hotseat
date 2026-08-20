@@ -46,6 +46,11 @@ pub struct SeqState {
     pub migrated_away: bool,
     pub pause_req: bool,
     pub paused: bool,
+    /// False while a destination worker is still receiving the sequence. The
+    /// decode thread is started early, before the pages have all arrived, so
+    /// that creating it is not part of the stop-the-world window; it waits here
+    /// until the handover completes.
+    pub ready: bool,
     pub log: Vec<TokenEvent>,
     /// Tokens decoded on this host (not counting any inherited from a source).
     pub decoded_here: usize,
@@ -111,6 +116,7 @@ impl Seq {
                 migrated_away: false,
                 pause_req: false,
                 paused: false,
+                ready: true,
                 log: Vec::new(),
                 decoded_here: 0,
             }),
@@ -157,6 +163,16 @@ impl Seq {
         self.cv.notify_all();
     }
 
+    /// Abandon a sequence that was pre-spawned but never completed its
+    /// handover, so its parked decode thread exits.
+    pub fn abandon(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.done = true;
+        st.done_reason = "handover failed".into();
+        st.ready = true;
+        self.cv.notify_all();
+    }
+
     /// Block until at least `n` positions are in the cache, or the sequence
     /// ends. Lets a test pin the migration to an exact point in the sequence
     /// instead of racing it with a sleep.
@@ -187,6 +203,9 @@ pub fn decode_loop(seq: Arc<Seq>) {
         // handover never has to serialise anything but tokens and pages.
         let (token, pos) = {
             let mut st = seq.state.lock().unwrap();
+            while !st.ready {
+                st = seq.cv.wait(st).unwrap();
+            }
             if st.pause_req {
                 let t0 = Instant::now();
                 st.paused = true;

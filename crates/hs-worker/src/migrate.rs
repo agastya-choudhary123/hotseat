@@ -29,6 +29,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::seq::{decode_loop, new_sampler, Seq};
+use hs_engine::sampler::SamplerCfg;
+
+/// Releases a pre-spawned decode thread if the handover does not complete.
+struct AbandonOnDrop(Option<Arc<Seq>>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            s.abandon();
+        }
+    }
+}
 use crate::worker::Worker;
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +152,23 @@ impl Report {
     }
 }
 
+/// Hash each live range separately, for finding *where* two caches differ.
+/// Enabled by `HS_DEBUG_RANGES`; both ends print, and the two lists are diffed.
+fn debug_ranges(who: &str, region: &Region, live: &[(usize, usize)]) {
+    if std::env::var_os("HS_DEBUG_RANGES").is_none() {
+        return;
+    }
+    // Plane 0 only, one line per position, so the first divergent position is
+    // obvious rather than "all 48 ranges differ".
+    let (off, len) = live[0];
+    let per = 512usize.min(len.max(1));
+    let n = len / per;
+    for p in n.saturating_sub(24)..n {
+        let b = unsafe { region.bytes(off + p * per, per) };
+        eprintln!("pos {p} hash {:#018x} [{who}]", hs_engine::hash::hash_wide(b));
+    }
+}
+
 pub fn fmt_bytes(b: u64) -> String {
     const U: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut v = b as f64;
@@ -155,18 +184,35 @@ pub fn fmt_bytes(b: u64) -> String {
     }
 }
 
-/// Whole pages covering `live`, as byte runs.
-fn live_page_runs(spec: &KvSpec, filled: usize, region: &Region) -> Vec<(u64, u64)> {
-    let live = spec.live_ranges(filled);
+/// How far to clip a *pre-copy* round: one position past what the sequence has
+/// committed.
+///
+/// The decode loop writes all of position p's K and V and only then increments
+/// `filled`, so at any moment a position past `filled` may be partly written.
+/// Those bytes must be sent even though nothing reads them yet, because the
+/// alternative is to lose them: writes made before the tracker was armed are
+/// invisible to it, and the model writes each (layer, position) slot exactly
+/// once, so a slot skipped here is never offered again.
+///
+/// Sending a partly-written position is harmless — its remaining layers fault
+/// after the arm and arrive in a later round, and nothing reads past `filled`.
+fn precopy_clip(filled: usize, max_ctx: usize) -> usize {
+    (filled + 1).min(max_ctx)
+}
+
+/// Everything in positions `from..to`, as merged byte runs.
+fn live_page_runs(spec: &KvSpec, from: usize, to: usize, region: &Region) -> Vec<(u64, u64)> {
+    let live = spec.live_ranges_between(from, to);
     let ps = region.page_size();
+    // Every page holding a live byte, then clipped straight back to the live
+    // bytes: the round-trip through the page set is what merges runs that the
+    // layout leaves adjacent.
     let set = PageSet::new(region.n_pages());
     for &(off, len) in &live {
         if len == 0 {
             continue;
         }
-        let first = off / ps;
-        let last = (off + len - 1) / ps;
-        set.mark_range(first, last - first + 1);
+        set.mark_range(off / ps, (off + len - 1) / ps - off / ps + 1);
     }
     runs_to_byte_runs(&set, ps, &live)
 }
@@ -208,7 +254,16 @@ pub fn migrate_out(
     let tokens_at = || seq.state.lock().unwrap().tokens.len();
     let mut t_mark = tokens_at();
     let filled0 = seq.filled();
-    let runs = live_page_runs(&seq.spec, filled0, &seq.region);
+    let mut clip = precopy_clip(filled0, seq.spec.max_ctx);
+    let runs = live_page_runs(&seq.spec, 0, clip, &seq.region);
+    // Positions below this have been handed over in full and, because the cache
+    // is append-only, cannot change again. Every later round starts here.
+    // Without it each round re-sends the whole of every dirty page, which for a
+    // 16 KiB page holding 32 positions is most of a round's bytes.
+    let mut low = clip.saturating_sub(1);
+    if std::env::var_os("HS_DEBUG_RANGES").is_some() {
+        eprintln!("round 0 filled={filled0} runs[0..4]={:?} total={}", &runs[..4.min(runs.len())], total_bytes(&runs));
+    }
     let t0 = Instant::now();
     conn.send(&Msg::Pages { round: 0, runs: runs.clone() })?;
     let sent = conn.send_page_bytes(&seq.region, &runs)?;
@@ -229,8 +284,14 @@ pub fn migrate_out(
     for round in 1..=opts.max_rounds {
         dirty.clear();
         seq.tracker.harvest(&dirty)?;
+
         let filled = seq.filled();
-        let runs = runs_to_byte_runs(&dirty, seq.region.page_size(), &seq.spec.live_ranges(filled));
+        clip = precopy_clip(filled, seq.spec.max_ctx);
+        let runs = runs_to_byte_runs(
+            &dirty,
+            seq.region.page_size(),
+            &seq.spec.live_ranges_between(low, clip),
+        );
         let bytes = total_bytes(&runs);
         if bytes == 0 {
             break;
@@ -248,6 +309,7 @@ pub fn migrate_out(
         });
         t_mark = now_tokens;
         rep.precopy_bytes += sent;
+        low = clip.saturating_sub(1);
 
         if bytes <= opts.target_bytes {
             break; // small enough to finish with the sequence stopped
@@ -284,16 +346,25 @@ pub fn migrate_out(
             st.max_tokens,
         )
     };
-    let live = seq.spec.live_ranges(filled);
+    // The decode loop is parked at the top of its iteration, so nothing is
+    // half-written and `filled` is exact -- no +1 here. The transfer covers
+    // only positions at or after the low-water mark; the hash still covers
+    // everything, because everything below it was already sent.
+    let live = seq.spec.live_ranges_between(low, filled);
     let runs = runs_to_byte_runs(&dirty, seq.region.page_size(), &live);
     rep.final_bytes = total_bytes(&runs);
-    rep.live_bytes = live.iter().map(|r| r.1 as u64).sum();
+    rep.live_bytes = seq.spec.live_ranges(filled).iter().map(|r| r.1 as u64).sum();
     rep.filled = filled;
     rep.tokens_total = tokens.len();
 
     let kv = seq.kv();
     rep.kv_hash_src = kv.hash(filled);
+    debug_ranges("src", &seq.region, &live);
 
+    if std::env::var_os("HS_DEBUG_RANGES").is_some() {
+        eprintln!("final filled={filled} dirty_pages={} runs[0..4]={:?} total={}",
+            dirty.count(), &runs[..4.min(runs.len())], total_bytes(&runs));
+    }
     let t_send = Instant::now();
     conn.send(&Msg::Pages { round: u32::MAX, runs: runs.clone() })?;
     conn.send_page_bytes(&seq.region, &runs)?;
@@ -399,6 +470,36 @@ pub fn migrate_in(worker: &Arc<Worker>, mut conn: Conn) -> io::Result<()> {
     region.prefault();
     let tracker = hs_track::open(region.clone(), worker.tracker_kind, worker.cluster)?;
     conn.send(&Msg::HelloAck { ok: true, reason: String::new() })?;
+    // The decode thread and the sequence object are created *before* the last
+    // page arrives, and the thread parks on `ready`. Spawning a thread was
+    // measured at 48 us on a good day and 943 us on a bad one, and every one of
+    // those microseconds used to land inside the stop-the-world window.
+    let mut sampler = new_sampler(SamplerCfg::default());
+    sampler.rng = hs_engine::sampler::Rng::seed(0);
+    let seq = Seq::new(
+        hello.seq_id,
+        worker.name.clone(),
+        worker.model.clone(),
+        worker.pool.clone(),
+        hello.spec,
+        region.clone(),
+        tracker,
+        Vec::new(),
+        0,
+        0,
+        sampler,
+        0,
+    );
+    seq.state.lock().unwrap().ready = false;
+    worker.take_slot(seq.clone()).map_err(io::Error::other)?;
+    {
+        let s = seq.clone();
+        std::thread::Builder::new()
+            .name(format!("hs-decode-{}", seq.id))
+            .spawn(move || decode_loop(s))?;
+    }
+    // From here on, any early return must release the parked thread.
+    let guard = AbandonOnDrop(Some(seq.clone()));
 
     // Page rounds land straight in the destination cache.
     let mut received = 0u64;
@@ -412,59 +513,56 @@ pub fn migrate_in(worker: &Arc<Worker>, mut conn: Conn) -> io::Result<()> {
             other => return Err(io::Error::other(format!("unexpected message: {other:?}"))),
         }
     };
+
+    // ---- the stop-the-world window on this side starts here ----------------
     let t_resume = Instant::now();
-
-    let seq = {
-        // SAFETY: nothing else references this region yet.
-        let kv = unsafe { hs_engine::kv::Kv::from_raw(region.as_ptr(), hello.spec) };
-        let our_hash = if fin.kv_hash != 0 { kv.hash(fin.filled as usize) } else { 0 };
-        if fin.kv_hash != 0 && our_hash != fin.kv_hash {
-            conn.send(&Msg::ResumeAck(hs_wire::ResumeAck {
-                ok: false,
-                kv_hash: our_hash,
-                resume_ns: t_resume.elapsed().as_nanos() as u64,
-                reason: "KV hash mismatch".into(),
-            }))?;
-            return Err(io::Error::other("KV hash mismatch"));
-        }
-
-        let mut sampler = new_sampler(fin.cfg);
-        sampler.rng = fin.rng; // the whole reason the transcript continues
-        let seq = Seq::new(
-            hello.seq_id,
-            worker.name.clone(),
-            worker.model.clone(),
-            worker.pool.clone(),
-            hello.spec,
-            region.clone(),
-            tracker,
-            fin.tokens.clone(),
-            fin.prompt_len as usize,
-            fin.filled as usize,
-            sampler,
-            fin.max_tokens as usize,
-        );
-        worker.take_slot(seq.clone()).map_err(io::Error::other)?;
-        let s = seq.clone();
-        std::thread::Builder::new()
-            .name(format!("hs-decode-{}", seq.id))
-            .spawn(move || decode_loop(s))?;
+    let kv = seq.kv();
+    let h0 = Instant::now();
+    let our_hash = if fin.kv_hash != 0 { kv.hash(fin.filled as usize) } else { 0 };
+    let t_hash = h0.elapsed().as_secs_f64() * 1e6;
+    debug_ranges("dst", &region, &hello.spec.live_ranges(fin.filled as usize));
+    if fin.kv_hash != 0 && our_hash != fin.kv_hash {
         conn.send(&Msg::ResumeAck(hs_wire::ResumeAck {
-            ok: true,
+            ok: false,
             kv_hash: our_hash,
             resume_ns: t_resume.elapsed().as_nanos() as u64,
-            reason: String::new(),
+            reason: "KV hash mismatch".into(),
         }))?;
-        seq
-    };
+        return Err(io::Error::other("KV hash mismatch"));
+    }
+
+    let b0 = Instant::now();
+    {
+        let mut st = seq.state.lock().unwrap();
+        st.tokens = fin.tokens.clone();
+        st.prompt_len = fin.prompt_len as usize;
+        st.filled = fin.filled as usize;
+        st.max_tokens = fin.max_tokens as usize;
+        st.sampler = new_sampler(fin.cfg);
+        st.sampler.rng = fin.rng; // the whole reason the transcript continues
+        st.ready = true;
+        seq.cv.notify_all();
+    }
+    let t_build = b0.elapsed().as_secs_f64() * 1e6;
+    conn.send(&Msg::ResumeAck(hs_wire::ResumeAck {
+        ok: true,
+        kv_hash: our_hash,
+        resume_ns: t_resume.elapsed().as_nanos() as u64,
+        reason: String::new(),
+    }))?;
+    std::mem::forget(guard); // handover complete; the sequence lives on
 
     eprintln!(
-        "[{}] took over sequence {} at position {} ({} tokens), {} received",
+        "[{}] took over sequence {} at position {} ({} tokens), {} received \
+         | resume {:.1} us = hash {:.1} + build/spawn {:.1}",
         worker.name,
         seq.id,
         fin.filled,
         fin.tokens.len(),
-        fmt_bytes(received)
+        fmt_bytes(received),
+        t_resume.elapsed().as_secs_f64() * 1e6,
+        t_hash,
+        t_build,
     );
     Ok(())
 }

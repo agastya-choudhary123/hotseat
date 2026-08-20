@@ -12,7 +12,7 @@
 //! threads happened to be scheduled.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 struct Shared {
@@ -23,6 +23,11 @@ struct Shared {
     /// between the `seq` bump and `done` reaching `n - 1`.
     job: [AtomicUsize; 2],
     n: usize,
+    /// Workers currently blocked rather than spinning. Checked on the dispatch
+    /// path, which is why it is a counter and not just a flag.
+    sleepers: AtomicUsize,
+    sleep_lock: Mutex<()>,
+    wake: Condvar,
 }
 
 pub struct Pool {
@@ -30,10 +35,16 @@ pub struct Pool {
     handles: Vec<JoinHandle<()>>,
 }
 
-/// How many times to spin before yielding. Long enough to cover a matvec
-/// dispatch on an idle machine, short enough not to burn a core when the
-/// process is descheduled.
+/// How many times to spin before yielding, and how many times to yield before
+/// blocking. The first stage keeps a dispatch under a microsecond while tokens
+/// are flowing; the last stage is what stops an idle worker from burning a core.
+///
+/// That last stage is not a nicety. Two workers on one machine with three
+/// spinning threads each will happily consume six cores doing nothing, and the
+/// visible symptom was a migration thread waiting 112 ms to be scheduled for
+/// work that takes 11 ms.
 const SPINS: u32 = 20_000;
+const YIELDS: u32 = 200;
 
 #[inline]
 fn spin_until(mut cond: impl FnMut() -> bool) {
@@ -41,10 +52,10 @@ fn spin_until(mut cond: impl FnMut() -> bool) {
     while !cond() {
         if i < SPINS {
             std::hint::spin_loop();
-            i += 1;
         } else {
             std::thread::yield_now();
         }
+        i = i.saturating_add(1);
     }
 }
 
@@ -58,6 +69,9 @@ impl Pool {
             stop: AtomicBool::new(false),
             job: [AtomicUsize::new(0), AtomicUsize::new(0)],
             n,
+            sleepers: AtomicUsize::new(0),
+            sleep_lock: Mutex::new(()),
+            wake: Condvar::new(),
         });
         let mut handles = Vec::with_capacity(n - 1);
         for tid in 1..n {
@@ -93,6 +107,10 @@ impl Pool {
         s.job[1].store(parts[1], Ordering::Relaxed);
         s.done.store(0, Ordering::Relaxed);
         s.seq.fetch_add(1, Ordering::Release);
+        if s.sleepers.load(Ordering::Acquire) != 0 {
+            let _g = s.sleep_lock.lock().unwrap();
+            s.wake.notify_all();
+        }
 
         f(0);
 
@@ -119,7 +137,27 @@ pub fn split(rows: usize, n: usize, tid: usize) -> (usize, usize) {
 fn worker(s: Arc<Shared>, tid: usize) {
     let mut last = 0u64;
     loop {
-        spin_until(|| s.stop.load(Ordering::Acquire) || s.seq.load(Ordering::Acquire) != last);
+        let ready = || s.stop.load(Ordering::Acquire) || s.seq.load(Ordering::Acquire) != last;
+        let mut i = 0u32;
+        while !ready() {
+            if i < SPINS {
+                std::hint::spin_loop();
+                i += 1;
+            } else if i < SPINS + YIELDS {
+                std::thread::yield_now();
+                i += 1;
+            } else {
+                // Block. The dispatcher bumps `seq` before it looks at
+                // `sleepers`, and this side registers as a sleeper before it
+                // re-checks `seq`, so a dispatch cannot slip between the two.
+                s.sleepers.fetch_add(1, Ordering::AcqRel);
+                let g = s.sleep_lock.lock().unwrap();
+                if !ready() {
+                    let _ = s.wake.wait_timeout(g, std::time::Duration::from_millis(2));
+                }
+                s.sleepers.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
         if s.stop.load(Ordering::Acquire) {
             return;
         }
@@ -136,6 +174,10 @@ fn worker(s: Arc<Shared>, tid: usize) {
 impl Drop for Pool {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
+        {
+            let _g = self.shared.sleep_lock.lock().unwrap();
+            self.shared.wake.notify_all();
+        }
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
@@ -176,6 +218,25 @@ mod tests {
         }
         for h in &hits {
             assert_eq!(h.load(Ordering::Relaxed), 100);
+        }
+    }
+
+    #[test]
+    fn broadcast_still_works_after_the_workers_have_gone_to_sleep() {
+        let p = Pool::new(4);
+        let hits: Vec<AtomicU32> = (0..4).map(|_| AtomicU32::new(0)).collect();
+        p.broadcast(|tid| {
+            hits[tid].fetch_add(1, Ordering::Relaxed);
+        });
+        // Long enough that every worker has passed the spin and yield stages.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..20 {
+            p.broadcast(|tid| {
+                hits[tid].fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        for h in &hits {
+            assert_eq!(h.load(Ordering::Relaxed), 21);
         }
     }
 

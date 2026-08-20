@@ -100,13 +100,16 @@ fn main() {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| model_path.clone());
 
+    // Resolve the tracker now and print what it actually is. `auto` picks the
+    // best mechanism the kernel has, and which one that turned out to be is the
+    // first thing you want to know from a log.
+    let tracker_name = probe_tracker(tracker_kind);
     eprintln!(
         "[{name}] {model_name} loaded in {:.2}s | fingerprint {:#018x}\n\
          [{name}] {spec}\n\
-         [{name}] {threads} threads, tracker {:?}, cluster {cluster}, page size {} B",
+         [{name}] {threads} threads, tracker {tracker_name}, cluster {cluster}, page size {} B",
         t0.elapsed().as_secs_f64(),
         model.fingerprint,
-        tracker_kind,
         hs_track::page_size(),
     );
 
@@ -138,6 +141,17 @@ fn main() {
                 }
             }
         });
+    }
+}
+
+/// Open a one-page tracker just to learn which backend `kind` resolves to.
+fn probe_tracker(kind: Kind) -> String {
+    match Region::new(hs_track::page_size())
+        .map_err(|e| e.to_string())
+        .and_then(|r| hs_track::open(Arc::new(r), kind, 1).map_err(|e| e.to_string()))
+    {
+        Ok(t) => format!("{} ({}exact)", t.name(), if t.is_exact() { "" } else { "IN" }),
+        Err(e) => die(&format!("tracker {kind:?} is not usable here: {e}")),
     }
 }
 
@@ -222,7 +236,7 @@ fn cmd_info(w: &Arc<Worker>) -> String {
     let spec = w.model.cfg.kv_spec(w.max_ctx, w.layout);
     format!(
         "name {}\nmodel {}\nfingerprint {:#018x}\nlayers {} heads {}/{} kv head_dim {} d_model {}\n\
-         kv {}\npage_size {}\ntracker {:?} cluster {}\nthreads {}\nos {} arch {}\n",
+         kv {}\npage_size {}\ntracker {} cluster {}\nthreads {}\nos {} arch {}\n",
         w.name,
         w.model_name,
         w.model.fingerprint,
@@ -233,7 +247,7 @@ fn cmd_info(w: &Arc<Worker>) -> String {
         w.model.cfg.d_model,
         spec,
         hs_track::page_size(),
-        w.tracker_kind,
+        probe_tracker(w.tracker_kind),
         w.cluster,
         w.pool.threads(),
         std::env::consts::OS,

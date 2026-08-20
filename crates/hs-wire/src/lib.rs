@@ -355,10 +355,22 @@ impl Conn {
 /// Turn a set of dirty pages into byte runs, clipped to the part of the cache
 /// that actually holds data.
 ///
-/// Clipping matters more than it looks. A KV cache is allocated for `max_ctx`
+/// Two things happen here and both are worth a lot of bytes.
+///
+/// **Clipping to the live set.** A KV cache is allocated for `max_ctx`
 /// positions and a sequence normally occupies a small prefix of it, so the
-/// dirty set and the *live* set are very different things — sending the union
-/// would move a hundred megabytes to hand over a sequence that is using four.
+/// dirty set and the live set are very different things; sending the union
+/// would move a hundred megabytes to hand over a sequence using four.
+///
+/// **Not rounding back out to page boundaries.** The tracker's unit is a page,
+/// but the transfer's unit does not have to be. One decode step writes
+/// `2 * n_layers` slices of a few hundred bytes each, scattered one per layer,
+/// so on a 16 KiB-page host a single token dirties 48 pages — 768 KiB of pages
+/// for 24 KiB of new cache, a 32x amplification that lands squarely in the
+/// stop-and-copy round. Sending only the live bytes *inside* those pages is
+/// exactly as correct: every live byte was written by some forward pass, so it
+/// is either in this dirty set or was sent in round 0, and the bytes outside
+/// the live set are uninitialised on both ends and never read by anything.
 pub fn runs_to_byte_runs(set: &PageSet, page_size: usize, live: &[(usize, usize)]) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
     for (first, count) in set.runs() {
@@ -366,9 +378,6 @@ pub fn runs_to_byte_runs(set: &PageSet, page_size: usize, live: &[(usize, usize)
         for &(lo, llen) in live {
             let (c, d) = (a.max(lo), b.min(lo + llen));
             if c < d {
-                // Whole pages, so the destination's cache stays byte-identical
-                // to the source's over everything the model will read.
-                let (c, d) = (c / page_size * page_size, d.div_ceil(page_size) * page_size);
                 push_merged(&mut out, c as u64, (d - c) as u64);
             }
         }
@@ -405,10 +414,10 @@ mod tests {
         let ps = 4096;
         let set = PageSet::new(100);
         set.mark_range(0, 100);
-        // Live: only the first 10000 bytes.
+        // Live: only the first 10000 bytes, so that is all that moves -- not
+        // the three whole pages those bytes sit in.
         let runs = runs_to_byte_runs(&set, ps, &[(0, 10_000)]);
-        assert_eq!(runs, vec![(0, 12_288)], "rounded out to whole pages");
-        assert_eq!(total_bytes(&runs), 12_288);
+        assert_eq!(runs, vec![(0, 10_000)]);
     }
 
     #[test]
@@ -419,6 +428,17 @@ mod tests {
         set.mark_range(7, 1);
         let runs = runs_to_byte_runs(&set, ps, &[(0, 100 * ps)]);
         assert_eq!(runs, vec![(3 * 4096, 5 * 4096)], "pages 3..8 are one run");
+    }
+
+    #[test]
+    fn a_dirty_page_only_costs_its_live_bytes() {
+        // The case that matters: one 16 KiB page holding 512 live bytes.
+        let ps = 16384;
+        let set = PageSet::new(8);
+        set.mark(2);
+        let runs = runs_to_byte_runs(&set, ps, &[(2 * ps, 512)]);
+        assert_eq!(runs, vec![(2 * 16384, 512)]);
+        assert_eq!(total_bytes(&runs), 512, "not a whole page");
     }
 
     #[test]

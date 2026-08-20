@@ -14,6 +14,12 @@ use std::sync::{Arc, Mutex};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// Take the serial lock, ignoring poisoning. One failing test must not turn
+/// every later test into `PoisonError`, which hides the failure that mattered.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Which backend to exercise. `HS_TRACKER=signal cargo test` runs the whole
 /// suite against `mprotect-signal`, and so on: every backend has to pass the
 /// same acceptance tests, or its entry in the table is a claim rather than a
@@ -40,7 +46,7 @@ fn poke(region: &Region, page: usize, val: u8) {
 
 #[test]
 fn reports_exactly_the_pages_written() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (region, t) = setup(64, 1);
     t.arm().unwrap();
 
@@ -59,7 +65,7 @@ fn reports_exactly_the_pages_written() {
 
 #[test]
 fn reads_never_fault() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (region, t) = setup(32, 1);
     t.arm().unwrap();
 
@@ -78,7 +84,7 @@ fn reads_never_fault() {
 
 #[test]
 fn each_round_reports_only_its_own_writes() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (region, t) = setup(64, 1);
     t.arm().unwrap();
 
@@ -101,7 +107,7 @@ fn each_round_reports_only_its_own_writes() {
 
 #[test]
 fn a_quiet_round_is_empty() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (region, t) = setup(16, 1);
     t.arm().unwrap();
     poke(&region, 3, 1);
@@ -115,7 +121,7 @@ fn a_quiet_round_is_empty() {
 
 #[test]
 fn repeated_writes_to_one_page_fault_once() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (region, t) = setup(16, 1);
     t.arm().unwrap();
     for i in 0..1000u32 {
@@ -129,7 +135,7 @@ fn repeated_writes_to_one_page_fault_once() {
 
 #[test]
 fn disarm_stops_tracking_and_leaves_memory_writable() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (region, t) = setup(16, 1);
     t.arm().unwrap();
     poke(&region, 2, 1);
@@ -147,7 +153,7 @@ fn disarm_stops_tracking_and_leaves_memory_writable() {
 
 #[test]
 fn clustering_reports_the_whole_cluster() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (region, t) = setup(64, 8);
     if t.name() == "soft-dirty" {
         return; // scan-based tracking has no cluster knob
@@ -170,7 +176,7 @@ fn clustering_reports_the_whole_cluster() {
 /// underneath it. Every page it touched must appear in some round.
 #[test]
 fn no_write_is_lost_across_a_round_boundary() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (region, t) = setup(512, 1);
     let exact = t.is_exact();
     let t: Arc<Box<dyn Tracker>> = Arc::new(t);
@@ -203,15 +209,19 @@ fn no_write_is_lost_across_a_round_boundary() {
     // Harvest on a round cadence, the way a migration does. A tight harvest
     // loop would also pass, but it spends all its time re-protecting a heavily
     // fragmented mapping and tells us nothing extra about the race.
+    //
+    // Rounds are counted, not writes: at 4 KiB pages and ~1 us per fault the
+    // writer can finish a write budget inside a single round, and a one-round
+    // test does not exercise a round boundary at all.
+    let rounds = 25;
     let union = PageSet::new(n_pages);
-    let mut rounds = 0;
-    while progress.load(Ordering::Relaxed) < 30_000 {
+    for _ in 0..rounds {
         let round = PageSet::new(n_pages);
         t.harvest(&round).unwrap();
         round.drain_into(&union);
-        rounds += 1;
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    let writes = progress.load(Ordering::Relaxed);
     stop.store(true, Ordering::Relaxed);
     let touched = writer.join().unwrap();
 
@@ -220,7 +230,7 @@ fn no_write_is_lost_across_a_round_boundary() {
     t.harvest(&last).unwrap();
     last.drain_into(&union);
 
-    assert!(rounds > 5, "test did not take enough rounds to be meaningful: {rounds}");
+    assert!(writes > 1000, "the writer barely ran ({writes} writes); nothing was tested");
     let missed: Vec<usize> =
         (0..n_pages).filter(|&p| touched[p] && !union.contains(p)).collect();
     if !exact {
@@ -255,7 +265,7 @@ fn no_write_is_lost_across_a_round_boundary() {
 /// worker did exactly that.
 #[test]
 fn two_regions_can_be_tracked_at_once() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let (r1, t1) = setup(16, 1);
     let (r2, t2) = setup(16, 1);
     t1.arm().unwrap();
@@ -284,7 +294,7 @@ fn two_regions_can_be_tracked_at_once() {
 
 #[test]
 fn none_backend_reports_everything() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = serial();
     let region = Arc::new(Region::new(16 * page_size()).unwrap());
     let t = open(region.clone(), Kind::None, 1).unwrap();
     t.arm().unwrap();
