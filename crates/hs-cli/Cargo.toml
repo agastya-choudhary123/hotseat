@@ -3,8 +3,9 @@ name = "hs-cli"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "hotseat"
+path = "src/main.rs"
+
 [dependencies]
 libc = { workspace = true }
-hs-engine = { workspace = true }
-hs-track = { workspace = true }
-hs-wire = { workspace = true }

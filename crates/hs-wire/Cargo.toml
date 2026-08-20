@@ -5,3 +5,5 @@ edition.workspace = true
 
 [dependencies]
 libc = { workspace = true }
+hs-engine = { workspace = true }
+hs-track = { workspace = true }

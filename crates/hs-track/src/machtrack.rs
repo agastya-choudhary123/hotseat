@@ -28,6 +28,17 @@
 //!            if e1 != e0 { mark(buf[e1 & 1], page) }
 //! ```
 //!
+//! # One handler per process
+//!
+//! `task_set_exception_ports` is task-wide, so the exception port and its
+//! handler thread are a process singleton and individual tracked regions
+//! register with it. The alternative — a port per tracker — looks fine until
+//! two trackers overlap for even an instant: the second one's `set` displaces
+//! the first, and the first one's drop restores the ports *it* saved, which
+//! deregisters the second. The symptom is a SIGBUS on a perfectly ordinary
+//! store into the second region, and it is not hypothetical; it is what
+//! starting a second sequence in one worker did.
+//!
 //! If the handler's `unprotect` lands after the bulk `protect`, then the epoch
 //! bump — which happens before the protect — is already visible, so `e1 != e0`
 //! and the page is re-marked into the round that is now current. If it lands
@@ -40,7 +51,11 @@ use crate::region::Region;
 use crate::{Stats, Tracker};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
+
+/// Time spent in the handler, summed over every region: the handler thread is
+/// shared, so this cannot live on one tracker.
+static FAULT_NS: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Mach bindings. Declared here rather than pulled from a crate so that the
@@ -67,8 +82,7 @@ const MACH_EXCEPTION_CODES: i32 = 0x8000_0000u32 as i32;
 
 const MACH_SEND_MSG: i32 = 1;
 const MACH_RCV_MSG: i32 = 2;
-const MACH_RCV_TIMEOUT: i32 = 0x100;
-const MACH_RCV_TIMED_OUT: i32 = 0x1000_4003u32 as i32;
+const MACH_MSG_TIMEOUT_NONE: u32 = 0;
 
 const MACH_MSGH_BITS_REMOTE_MASK: u32 = 0x1f;
 
@@ -80,8 +94,6 @@ const MSG_ID_EXCEPTION_RAISE: i32 = 2405;
 const THREAD_STATE_NONE: i32 = 5;
 #[cfg(not(target_arch = "aarch64"))]
 const THREAD_STATE_NONE: i32 = 13;
-
-const EXC_SLOTS: usize = 32;
 
 extern "C" {
     /// `mach_task_self()` is a macro over this global in C.
@@ -102,22 +114,12 @@ extern "C" {
         poly_poly: u32,
     ) -> KernReturn;
     fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
-    fn mach_port_mod_refs(task: MachPort, name: MachPort, right: u32, delta: i32) -> KernReturn;
     fn task_set_exception_ports(
         task: MachPort,
         exception_mask: u32,
         new_port: MachPort,
         behavior: i32,
         new_flavor: i32,
-    ) -> KernReturn;
-    fn task_get_exception_ports(
-        task: MachPort,
-        exception_mask: u32,
-        masks: *mut u32,
-        masks_cnt: *mut u32,
-        old_handlers: *mut MachPort,
-        old_behaviors: *mut i32,
-        old_flavors: *mut i32,
     ) -> KernReturn;
     fn mach_msg(
         msg: *mut MachMsgHeader,
@@ -208,6 +210,8 @@ struct RecvBuf([u8; 512]);
 
 struct Inner {
     region: Arc<Region>,
+    /// Cleared on drop; a deregistered region's faults are not ours.
+    registered: AtomicBool,
     /// Two dirty sets; `epoch & 1` selects the one currently accumulating.
     bufs: [PageSet; 2],
     epoch: AtomicU64,
@@ -215,8 +219,6 @@ struct Inner {
     /// dirty set for fewer faults and fewer VM map entries — see `docs/`.
     cluster: usize,
     armed: AtomicBool,
-    stop: AtomicBool,
-    port: MachPort,
     faults: AtomicU64,
     fault_ns: AtomicU64,
     pages_marked: AtomicU64,
@@ -232,18 +234,60 @@ unsafe impl Sync for Inner {}
 
 pub struct MachTracker {
     inner: Arc<Inner>,
-    handler: Option<std::thread::JoinHandle<()>>,
-    saved: SavedPorts,
 }
 
-/// The task's previous `EXC_BAD_ACCESS` handlers, restored on drop so that the
-/// tracker does not permanently take over the process's crash handling.
-struct SavedPorts {
-    count: u32,
-    masks: [u32; EXC_SLOTS],
-    handlers: [MachPort; EXC_SLOTS],
-    behaviors: [i32; EXC_SLOTS],
-    flavors: [i32; EXC_SLOTS],
+/// The task-wide exception port and the thread that drains it.
+///
+/// Created once, on the first tracker, and never torn down: the handler must
+/// outlive every region it might be asked about, and a process that has
+/// finished tracking has nothing to gain from giving the port back.
+struct Exceptions {
+    port: MachPort,
+    /// Regions currently being tracked. Read on every fault, written only when
+    /// a sequence starts or ends, so a plain `RwLock` is the right shape.
+    regions: RwLock<Vec<Arc<Inner>>>,
+}
+
+unsafe impl Send for Exceptions {}
+unsafe impl Sync for Exceptions {}
+
+static EXCEPTIONS: OnceLock<io::Result<&'static Exceptions>> = OnceLock::new();
+
+fn exceptions() -> io::Result<&'static Exceptions> {
+    EXCEPTIONS
+        .get_or_init(|| {
+            let task = task_self();
+            let mut port: MachPort = 0;
+            unsafe {
+                kr(
+                    "mach_port_allocate",
+                    mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &mut port),
+                )?;
+                kr(
+                    "mach_port_insert_right",
+                    mach_port_insert_right(task, port, port, MACH_MSG_TYPE_MAKE_SEND),
+                )?;
+                kr(
+                    "task_set_exception_ports",
+                    task_set_exception_ports(
+                        task,
+                        EXC_MASK_BAD_ACCESS,
+                        port,
+                        EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+                        THREAD_STATE_NONE,
+                    ),
+                )?;
+            }
+            let e: &'static Exceptions =
+                Box::leak(Box::new(Exceptions { port, regions: RwLock::new(Vec::new()) }));
+            std::thread::Builder::new()
+                .name("hs-mach-exc".into())
+                .spawn(move || handler_loop(e))?;
+            Ok(e)
+        })
+        .as_ref()
+        .copied()
+        .map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
 fn kr(what: &'static str, r: KernReturn) -> io::Result<()> {
@@ -257,48 +301,15 @@ fn kr(what: &'static str, r: KernReturn) -> io::Result<()> {
 impl MachTracker {
     pub fn new(region: Arc<Region>, cluster: usize) -> io::Result<MachTracker> {
         assert!(cluster >= 1, "fault cluster must be at least one page");
-        let task = task_self();
-
-        let mut port: MachPort = 0;
-        unsafe {
-            kr("mach_port_allocate", mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &mut port))?;
-            kr(
-                "mach_port_insert_right",
-                mach_port_insert_right(task, port, port, MACH_MSG_TYPE_MAKE_SEND),
-            )?;
-        }
-
-        let mut saved = SavedPorts {
-            count: EXC_SLOTS as u32,
-            masks: [0; EXC_SLOTS],
-            handlers: [0; EXC_SLOTS],
-            behaviors: [0; EXC_SLOTS],
-            flavors: [0; EXC_SLOTS],
-        };
-        unsafe {
-            kr(
-                "task_get_exception_ports",
-                task_get_exception_ports(
-                    task,
-                    EXC_MASK_BAD_ACCESS,
-                    saved.masks.as_mut_ptr(),
-                    &mut saved.count,
-                    saved.handlers.as_mut_ptr(),
-                    saved.behaviors.as_mut_ptr(),
-                    saved.flavors.as_mut_ptr(),
-                ),
-            )?;
-        }
-
+        let ex = exceptions()?;
         let n_pages = region.n_pages();
         let inner = Arc::new(Inner {
             region,
+            registered: AtomicBool::new(true),
             bufs: [PageSet::new(n_pages), PageSet::new(n_pages)],
             epoch: AtomicU64::new(0),
             cluster,
             armed: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-            port,
             faults: AtomicU64::new(0),
             fault_ns: AtomicU64::new(0),
             pages_marked: AtomicU64::new(0),
@@ -306,26 +317,8 @@ impl MachTracker {
             rearm_ns: AtomicU64::new(0),
             foreign: AtomicU64::new(0),
         });
-
-        unsafe {
-            kr(
-                "task_set_exception_ports",
-                task_set_exception_ports(
-                    task,
-                    EXC_MASK_BAD_ACCESS,
-                    port,
-                    EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
-                    THREAD_STATE_NONE,
-                ),
-            )?;
-        }
-
-        let h = inner.clone();
-        let handler = std::thread::Builder::new()
-            .name("hs-mach-exc".into())
-            .spawn(move || handler_loop(h))?;
-
-        Ok(MachTracker { inner, handler: Some(handler), saved })
+        ex.regions.write().unwrap().push(inner.clone());
+        Ok(MachTracker { inner })
     }
 
     fn protect_all(&self, prot: VmProt) -> io::Result<()> {
@@ -394,38 +387,10 @@ impl Tracker for MachTracker {
 impl Drop for MachTracker {
     fn drop(&mut self) {
         let _ = self.disarm();
-        self.inner.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handler.take() {
-            let _ = h.join();
-        }
-        unsafe {
-            let task = task_self();
-            // Put the previous EXC_BAD_ACCESS handlers back before dropping our
-            // port, so a later genuine crash is reported the way it would have
-            // been if this tracker had never existed.
-            for i in 0..self.saved.count as usize {
-                task_set_exception_ports(
-                    task,
-                    self.saved.masks[i],
-                    self.saved.handlers[i],
-                    self.saved.behaviors[i],
-                    self.saved.flavors[i],
-                );
-                if self.saved.handlers[i] != MACH_PORT_NULL {
-                    mach_port_deallocate(task, self.saved.handlers[i]);
-                }
-            }
-            if self.saved.count == 0 {
-                task_set_exception_ports(
-                    task,
-                    EXC_MASK_BAD_ACCESS,
-                    MACH_PORT_NULL,
-                    EXCEPTION_DEFAULT,
-                    THREAD_STATE_NONE,
-                );
-            }
-            mach_port_deallocate(task, self.inner.port);
-            mach_port_mod_refs(task, self.inner.port, MACH_PORT_RIGHT_RECEIVE, -1);
+        self.inner.registered.store(false, Ordering::Release);
+        if let Ok(ex) = exceptions() {
+            let mut r = ex.regions.write().unwrap();
+            r.retain(|i| !Arc::ptr_eq(i, &self.inner));
         }
     }
 }
@@ -434,28 +399,25 @@ impl Drop for MachTracker {
 ///
 /// The receive has a timeout only so that this thread notices `stop`; a
 /// timed-out receive is not an error.
-fn handler_loop(inner: Arc<Inner>) {
+fn handler_loop(ex: &'static Exceptions) {
     let task = task_self();
     let trace = std::env::var_os("HS_TRACK_TRACE").is_some();
     if trace {
-        eprintln!("hs-track: handler thread up on port {}", inner.port);
+        eprintln!("hs-track: handler thread up on port {}", ex.port);
     }
     let mut buf = RecvBuf([0u8; 512]);
-    while !inner.stop.load(Ordering::Acquire) {
+    loop {
         let rc = unsafe {
             mach_msg(
                 buf.0.as_mut_ptr() as *mut MachMsgHeader,
-                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                MACH_RCV_MSG,
                 0,
                 buf.0.len() as u32,
-                inner.port,
-                50, // ms
+                ex.port,
+                MACH_MSG_TIMEOUT_NONE,
                 MACH_PORT_NULL,
             )
         };
-        if rc == MACH_RCV_TIMED_OUT {
-            continue;
-        }
         if trace {
             let h = unsafe { &*(buf.0.as_ptr() as *const MachMsgHeader) };
             eprintln!("hs-track: msg rc={rc:#x} id={} size={} bits={:#x}", h.id, h.size, h.bits);
@@ -475,7 +437,7 @@ fn handler_loop(inner: Arc<Inner>) {
                 let (e, r, a) = (req.exception, req.code_reason, req.code_addr);
                 eprintln!("hs-track: exception={e} reason={r} at {a:#x}");
             }
-            handle_fault(&inner, req.code_addr as usize)
+            handle_fault(ex, req.code_addr as usize)
         } else {
             KERN_FAILURE
         };
@@ -520,7 +482,7 @@ fn handler_loop(inner: Arc<Inner>) {
         if src != KERN_SUCCESS {
             eprintln!("hs-track: mach_msg reply failed: {src}");
         }
-        inner.fault_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        FAULT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -530,12 +492,18 @@ fn handler_loop(inner: Arc<Inner>) {
 /// kernel pass the exception along to the next handler, which is what turns a
 /// genuine null-pointer dereference elsewhere in the process back into an
 /// ordinary crash instead of a silent hang.
-fn handle_fault(inner: &Inner, addr: usize) -> KernReturn {
-    let Some(page) = inner.region.page_of(addr) else {
-        inner.foreign.fetch_add(1, Ordering::Relaxed);
+fn handle_fault(ex: &'static Exceptions, addr: usize) -> KernReturn {
+    // Find the tracked region containing the address. A fault anywhere else is
+    // somebody's real bug and must be handed on, not swallowed.
+    let regions = ex.regions.read().unwrap();
+    let Some((inner, page)) = regions.iter().find_map(|i| {
+        i.region.page_of(addr).map(|p| (i.clone(), p))
+    }) else {
         return KERN_FAILURE;
     };
-    if !inner.armed.load(Ordering::Acquire) {
+    drop(regions);
+    let inner = &*inner;
+    if !inner.armed.load(Ordering::Acquire) || !inner.registered.load(Ordering::Acquire) {
         inner.foreign.fetch_add(1, Ordering::Relaxed);
         return KERN_FAILURE;
     }

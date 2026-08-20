@@ -252,7 +252,7 @@ impl Kv {
 
     /// Content hash over the live prefix, for proving two caches are identical.
     pub fn hash(&self, n_pos: usize) -> u64 {
-        let mut h = crate::hash::Fnv::new();
+        let mut h = crate::hash::Wide::new();
         for (off, len) in self.spec.live_ranges(n_pos) {
             let bytes = unsafe { std::slice::from_raw_parts(self.base().add(off), len) };
             h.write(bytes);

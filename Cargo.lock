@@ -6,9 +6,6 @@ version = 4
 name = "hs-cli"
 version = "0.1.0"
 dependencies = [
- "hs-engine",
- "hs-track",
- "hs-wire",
  "libc",
 ]
 
@@ -30,6 +27,8 @@ dependencies = [
 name = "hs-wire"
 version = "0.1.0"
 dependencies = [
+ "hs-engine",
+ "hs-track",
  "libc",
 ]
 

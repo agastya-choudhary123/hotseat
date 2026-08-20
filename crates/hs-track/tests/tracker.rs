@@ -220,6 +220,42 @@ fn no_write_is_lost_across_a_round_boundary() {
     );
 }
 
+/// Regression: two tracked regions alive at the same time.
+///
+/// On macOS the exception port is task-wide. An earlier version created one per
+/// tracker, so the second `task_set_exception_ports` displaced the first and
+/// the first tracker's drop deregistered the second — after which an ordinary
+/// store into the second region took a SIGBUS. Starting a second sequence in a
+/// worker did exactly that.
+#[test]
+fn two_regions_can_be_tracked_at_once() {
+    let _g = SERIAL.lock().unwrap();
+    let (r1, t1) = setup(16, 1);
+    let (r2, t2) = setup(16, 1);
+    t1.arm().unwrap();
+    t2.arm().unwrap();
+
+    poke(&r1, 1, 1);
+    poke(&r2, 2, 1);
+
+    let s1 = PageSet::new(r1.n_pages());
+    let s2 = PageSet::new(r2.n_pages());
+    t1.harvest(&s1).unwrap();
+    t2.harvest(&s2).unwrap();
+    assert_eq!(s1.runs(), vec![(1, 1)], "first region");
+    assert_eq!(s2.runs(), vec![(2, 1)], "second region");
+
+    // Dropping one must leave the other working.
+    drop(t1);
+    poke(&r2, 5, 1);
+    let s3 = PageSet::new(r2.n_pages());
+    t2.harvest(&s3).unwrap();
+    assert_eq!(s3.runs(), vec![(5, 1)], "second region after the first was dropped");
+
+    // And the dropped region is plain memory again.
+    poke(&r1, 9, 1);
+}
+
 #[test]
 fn none_backend_reports_everything() {
     let _g = SERIAL.lock().unwrap();
