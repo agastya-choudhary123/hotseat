@@ -53,9 +53,19 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-/// Time spent in the handler, summed over every region: the handler thread is
-/// shared, so this cannot live on one tracker.
-static FAULT_NS: AtomicU64 = AtomicU64::new(0);
+/// Time from message received to reply sent, summed over every region. The
+/// handler thread is shared, so this cannot live on one tracker.
+static MSG_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Average microseconds between receiving an exception message and replying to
+/// it, across the whole process.
+pub fn msg_us_avg(faults: u64) -> f64 {
+    if faults == 0 {
+        0.0
+    } else {
+        MSG_NS.load(Ordering::Relaxed) as f64 / faults as f64 / 1e3
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Mach bindings. Declared here rather than pulled from a crate so that the
@@ -482,7 +492,7 @@ fn handler_loop(ex: &'static Exceptions) {
         if src != KERN_SUCCESS {
             eprintln!("hs-track: mach_msg reply failed: {src}");
         }
-        FAULT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        MSG_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -493,6 +503,7 @@ fn handler_loop(ex: &'static Exceptions) {
 /// genuine null-pointer dereference elsewhere in the process back into an
 /// ordinary crash instead of a silent hang.
 fn handle_fault(ex: &'static Exceptions, addr: usize) -> KernReturn {
+    let t0 = std::time::Instant::now();
     // Find the tracked region containing the address. A fault anywhere else is
     // somebody's real bug and must be handed on, not swallowed.
     let regions = ex.regions.read().unwrap();
@@ -538,5 +549,9 @@ fn handle_fault(ex: &'static Exceptions, addr: usize) -> KernReturn {
 
     inner.faults.fetch_add(1, Ordering::Relaxed);
     inner.pages_marked.fetch_add(count as u64, Ordering::Relaxed);
+    // Handler work only, so it is comparable with the signal backend's number.
+    // The two mach_msg round trips around it are what `faultbench`'s end-to-end
+    // figure adds on top.
+    inner.fault_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     KERN_SUCCESS
 }

@@ -21,15 +21,24 @@ fn touch_all(region: &Region, stride_pages: usize) {
 
 fn main() {
     let mb: usize = std::env::args().nth(1).map_or(112, |s| s.parse().unwrap());
+    let kind = std::env::args()
+        .nth(2)
+        .map(|s| Kind::parse(&s).unwrap_or_else(|| panic!("unknown tracker {s:?}")))
+        .unwrap_or(Kind::Auto);
     let bytes = mb * (1 << 20);
     let ps = page_size();
-    println!("region {mb} MiB, page size {ps} B, {} pages\n", bytes / ps);
+    let probe = Region::new(ps).unwrap();
+    let name = open(Arc::new(probe), kind, 1).unwrap().name();
+    println!("tracker {name} | region {mb} MiB, page size {ps} B, {} pages\n", bytes / ps);
 
-    println!("{:<10} {:>12} {:>12} {:>12} {:>14} {:>12}", "cluster", "faults", "us/fault", "pages/s", "rearm us", "MiB/s dirty");
+    println!(
+        "{:<8} {:>10} {:>12} {:>12} {:>11} {:>11} {:>12}",
+        "cluster", "faults", "us/fault", "in handler", "pages/s", "rearm us", "MiB/s dirty"
+    );
     for cluster in [1usize, 2, 4, 8, 16, 64] {
         let region = Arc::new(Region::new(bytes).unwrap());
         region.prefault();
-        let t = open(region.clone(), Kind::Auto, cluster).unwrap();
+        let t = open(region.clone(), kind, cluster).unwrap();
         t.arm().unwrap();
 
         let t0 = Instant::now();
@@ -43,11 +52,13 @@ fn main() {
 
         let s = t.stats();
         assert_eq!(out.count(), region.n_pages(), "every page was written");
+        let handler_us = s.ns_per_fault() / 1e3;
         println!(
-            "{:<10} {:>12} {:>12.2} {:>12.0} {:>14.1} {:>12.0}",
+            "{:<8} {:>10} {:>12.2} {:>12.2} {:>11.0} {:>11.1} {:>12.0}",
             cluster,
             s.faults,
             el.as_secs_f64() * 1e6 / s.faults.max(1) as f64,
+            handler_us,
             region.n_pages() as f64 / el.as_secs_f64(),
             rearm.as_secs_f64() * 1e6,
             (region.n_pages() * ps) as f64 / el.as_secs_f64() / (1 << 20) as f64,
@@ -59,7 +70,7 @@ fn main() {
     println!();
     let region = Arc::new(Region::new(bytes).unwrap());
     region.prefault();
-    let t = open(region.clone(), Kind::Auto, 1).unwrap();
+    let t = open(region.clone(), kind, 1).unwrap();
     t.arm().unwrap();
     let out = PageSet::new(region.n_pages());
     let mut clean = Vec::new();

@@ -11,6 +11,7 @@
 //! |---|---|---|
 //! | `mach-vm-protect` (macOS) | write-protect + Mach exception messages | per *first write* to a page |
 //! | `uffd-wp` (Linux) | `userfaultfd` write-protect mode | per first write to a page |
+//! | `mprotect-signal` (any Unix) | `mprotect` + `SIGSEGV`/`SIGBUS` | per first write, handled on the faulting thread |
 //! | `soft-dirty` (Linux) | `clear_refs` + `pagemap` bits | per *scan*, proportional to region size |
 //! | `none` | assume everything changed | free, and useless |
 //!
@@ -29,6 +30,7 @@ pub mod region;
 
 #[cfg(target_os = "macos")]
 pub mod machtrack;
+pub mod signal;
 #[cfg(target_os = "linux")]
 pub mod softdirty;
 #[cfg(target_os = "linux")]
@@ -86,6 +88,16 @@ pub trait Tracker: Send + Sync {
     fn stats(&self) -> Stats;
     fn name(&self) -> &'static str;
     fn region(&self) -> &Arc<Region>;
+
+    /// Whether the dirty set is guaranteed complete for a *running* writer.
+    ///
+    /// True for the fault-driven backends: the permission and the record change
+    /// under the same fault, so there is no window. False for `soft-dirty`,
+    /// which cannot read and clear the bits atomically, and for `none`, which
+    /// is complete only because it reports everything.
+    fn is_exact(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +106,8 @@ pub enum Kind {
     Auto,
     Mach,
     Uffd,
+    /// `mprotect` plus a `SIGSEGV`/`SIGBUS` handler. Works everywhere.
+    Signal,
     SoftDirty,
     None,
 }
@@ -104,6 +118,7 @@ impl Kind {
             "auto" => Kind::Auto,
             "mach" => Kind::Mach,
             "uffd" => Kind::Uffd,
+            "signal" | "mprotect" => Kind::Signal,
             "soft-dirty" | "softdirty" => Kind::SoftDirty,
             "none" => Kind::None,
             _ => return None,
@@ -121,20 +136,26 @@ pub fn open(region: Arc<Region>, kind: Kind, cluster: usize) -> io::Result<Box<d
     match kind {
         Kind::None => Ok(Box::new(NoTracker { region })),
         Kind::Auto => {
+            // Pick the best mechanism this kernel actually has. Both candidates
+            // are exact, so this is a choice between equals on correctness --
+            // and the worker prints which one it got.
             #[cfg(target_os = "macos")]
             {
                 Ok(Box::new(machtrack::MachTracker::new(region, cluster)?))
             }
             #[cfg(target_os = "linux")]
             {
-                uffd::UffdTracker::new(region, cluster).map(|t| Box::new(t) as Box<dyn Tracker>)
+                match uffd::UffdTracker::new(region.clone(), cluster) {
+                    Ok(t) => Ok(Box::new(t)),
+                    Err(_) => Ok(Box::new(signal::SignalTracker::new(region, cluster)?)),
+                }
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
-                let _ = cluster;
-                Err(io::Error::other("no dirty-page tracker for this platform"))
+                Ok(Box::new(signal::SignalTracker::new(region, cluster)?))
             }
         }
+        Kind::Signal => Ok(Box::new(signal::SignalTracker::new(region, cluster)?)),
         #[cfg(target_os = "macos")]
         Kind::Mach => Ok(Box::new(machtrack::MachTracker::new(region, cluster)?)),
         #[cfg(target_os = "linux")]
