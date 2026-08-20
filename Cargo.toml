@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hs-engine",
+    "crates/hs-track",
+    "crates/hs-wire",
+    "crates/hs-worker",
+    "crates/hs-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[workspace.dependencies]
+libc = "0.2"
+hs-engine = { path = "crates/hs-engine" }
+hs-track  = { path = "crates/hs-track" }
+hs-wire   = { path = "crates/hs-wire" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1

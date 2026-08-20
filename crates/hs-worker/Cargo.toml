@@ -1,0 +1,10 @@
+[package]
+name = "hs-worker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+hs-engine = { workspace = true }
+hs-track = { workspace = true }
+hs-wire = { workspace = true }
