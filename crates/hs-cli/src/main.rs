@@ -15,6 +15,7 @@ hotseat <host:port> <command> [args...]
   status                    where the sequence has got to
   transcript                tokens, per-token timings, KV hash, decoded text
   wait                      block until the sequence finishes, then print it
+  stop                      end the current sequence and free the slot
   migrate <host:port> [rounds=n] [target=bytes] [verify]
   shutdown
 ";

@@ -221,6 +221,14 @@ fn command(w: &Arc<Worker>, line: &str) -> String {
             None => "error: no sequence\n".into(),
         },
         "migrate" => cmd_migrate(w, rest),
+        "stop" => match w.current() {
+            Some(s) => {
+                s.stop("stopped");
+                s.wait_exited();
+                format!("ok stopped seq {}\n", s.id)
+            }
+            None => "ok no sequence\n".into(),
+        },
         "shutdown" => {
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -421,13 +429,15 @@ fn cmd_migrate(w: &Arc<Worker>, rest: &str) -> String {
             Some(("rounds", v)) => opts.max_rounds = v.parse().unwrap_or(opts.max_rounds),
             Some(("target", v)) => opts.target_bytes = v.parse().unwrap_or(opts.target_bytes),
             Some(("at", v)) => at = v.parse().ok(),
+            Some(("mbps", v)) => opts.mbps = v.parse().unwrap_or(0.0),
             _ if tok == "verify" => opts.verify = true,
             _ if tok == "norng" => opts.drop_rng = true,
             _ => target = tok.to_string(),
         }
     }
     if target.is_empty() {
-        return "error: migrate <host:port> [at=n] [rounds=n] [target=bytes] [verify] [norng]\n"
+        return "error: migrate <host:port> [at=n] [rounds=n] [target=bytes] [mbps=n] \
+                [verify] [norng]\n"
             .into();
     }
     if let Some(n) = at {

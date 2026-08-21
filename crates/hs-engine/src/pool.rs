@@ -33,6 +33,15 @@ struct Shared {
 pub struct Pool {
     shared: Arc<Shared>,
     handles: Vec<JoinHandle<()>>,
+    /// One dispatch at a time.
+    ///
+    /// The pool has a single job slot, so two threads calling `broadcast`
+    /// concurrently would have the workers run one closure with the other's
+    /// bounds. A worker hosting a sequence while receiving another has exactly
+    /// two decode threads sharing one pool, and the symptom was a pool worker
+    /// indexing a 128-element bias at 688. An uncontended lock costs tens of
+    /// nanoseconds against a dispatch that does microseconds of work.
+    dispatch: Mutex<()>,
 }
 
 /// How many times to spin before yielding, and how many times to yield before
@@ -83,7 +92,7 @@ impl Pool {
                     .expect("spawn pool worker"),
             );
         }
-        Pool { shared, handles }
+        Pool { shared, handles, dispatch: Mutex::new(()) }
     }
 
     pub fn threads(&self) -> usize {
@@ -94,6 +103,7 @@ impl Pool {
     /// have finished.
     pub fn broadcast<F: Fn(usize) + Sync>(&self, f: F) {
         let s = &self.shared;
+        let _dispatch = self.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         if s.n == 1 {
             f(0);
             return;
@@ -219,6 +229,35 @@ mod tests {
         for h in &hits {
             assert_eq!(h.load(Ordering::Relaxed), 100);
         }
+    }
+
+    #[test]
+    fn concurrent_broadcasts_do_not_interleave_their_jobs() {
+        // Two threads dispatching different-sized jobs at once. Without the
+        // dispatch lock, a worker runs one closure while another has already
+        // replaced the job pointer.
+        let p = Arc::new(Pool::new(4));
+        let bad = Arc::new(AtomicU32::new(0));
+        let mut hs = Vec::new();
+        for which in 0..2u32 {
+            let p = p.clone();
+            let bad = bad.clone();
+            hs.push(std::thread::spawn(move || {
+                let n = if which == 0 { 64usize } else { 4096 };
+                for _ in 0..2000 {
+                    p.broadcast(|tid| {
+                        let (a, b) = split(n, 4, tid);
+                        if b > n || a > b {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(bad.load(Ordering::Relaxed), 0);
     }
 
     #[test]

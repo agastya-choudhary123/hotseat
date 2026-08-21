@@ -66,13 +66,20 @@ impl Worker {
     }
 
     /// Claim the slot, refusing if a sequence is still running there.
+    ///
+    /// A finished sequence's decode thread may still be inside a forward pass,
+    /// and it shares this worker's thread pool with whatever comes next, so the
+    /// slot is not free until that thread has actually left.
     pub fn take_slot(&self, seq: Arc<Seq>) -> Result<(), String> {
         let mut s = self.slot.lock().unwrap();
         if let Some(old) = s.as_ref() {
-            let st = old.state.lock().unwrap();
-            if !st.done && !st.migrated_away {
-                return Err(format!("sequence {} is still running here", old.id));
+            {
+                let st = old.state.lock().unwrap();
+                if !st.done && !st.migrated_away {
+                    return Err(format!("sequence {} is still running here", old.id));
+                }
             }
+            old.wait_exited();
         }
         *s = Some(seq);
         Ok(())

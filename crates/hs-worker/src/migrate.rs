@@ -53,6 +53,9 @@ pub struct Opts {
     /// Costs real time inside the stop-the-world window, so it is off unless
     /// asked for; the report prints the window both ways.
     pub verify: bool,
+    /// Shape the link for bulk page data, in megabits per second. Zero means
+    /// unlimited.
+    pub mbps: f64,
     /// Test affordance: hand over a *re-seeded* sampler instead of the live
     /// one. The transfer succeeds, the KV cache matches, and the transcript
     /// diverges anyway — which is how the determinism test proves it is
@@ -62,7 +65,7 @@ pub struct Opts {
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { max_rounds: 8, target_bytes: 1 << 20, verify: false, drop_rng: false }
+        Opts { max_rounds: 8, target_bytes: 1 << 20, verify: false, mbps: 0.0, drop_rng: false }
     }
 }
 
@@ -99,6 +102,10 @@ pub struct Report {
     pub kv_hash_src: u64,
     pub kv_hash_dst: u64,
     pub verified: bool,
+    /// False when the rounds were stopped because they were not shrinking.
+    pub converged: bool,
+    pub stop_reason: String,
+    pub mbps: f64,
     pub tracker: String,
     pub faults: u64,
     pub fault_us_avg: f64,
@@ -127,11 +134,17 @@ impl Report {
             ));
         }
         s.push_str(&format!(
-            "pre-copy {} in {:.1} ms over {} rounds ({:.0} MiB/s)\n",
+            "pre-copy {} in {:.1} ms over {} rounds ({:.0} MiB/s{})\n",
             fmt_bytes(self.precopy_bytes),
             self.precopy_ms,
             self.rounds.len(),
-            self.precopy_bytes as f64 / (1 << 20) as f64 / (self.precopy_ms / 1000.0).max(1e-9)
+            self.precopy_bytes as f64 / (1 << 20) as f64 / (self.precopy_ms / 1000.0).max(1e-9),
+            if self.mbps > 0.0 { format!(", link shaped to {:.0} Mbit/s", self.mbps) } else { String::new() }
+        ));
+        s.push_str(&format!(
+            "rounds stopped: {} [{}]\n",
+            if self.stop_reason.is_empty() { "converged" } else { &self.stop_reason },
+            if self.converged { "converged" } else { "DID NOT CONVERGE" }
         ));
         s.push_str(&format!(
             "stop-the-world {:.1} us  (park {:.1} us, send {} in {:.1} us, destination {:.1} us)\n",
@@ -226,7 +239,13 @@ pub fn migrate_out(
     opts: &Opts,
 ) -> io::Result<Report> {
     let mut conn = Conn::connect(target)?;
-    let mut rep = Report { target: target.to_string(), ..Default::default() };
+    conn.set_rate_mbps(opts.mbps);
+    let mut rep = Report {
+        target: target.to_string(),
+        mbps: opts.mbps,
+        converged: true,
+        ..Default::default()
+    };
 
     conn.send(&Msg::Hello(Hello {
         proto: PROTO,
@@ -279,10 +298,15 @@ pub fn migrate_out(
     rep.precopy_bytes += sent;
 
     // ---- iterative rounds --------------------------------------------------
+    //
+    // `dirty` is cleared only after a round has actually been *sent*. A round
+    // that is harvested and then abandoned -- which is what the convergence
+    // check does -- must leave its pages in the set, or they are lost: the
+    // harvest re-armed them, so nothing will report them again. `harvest` ORs
+    // into the set, so carrying one forward is just not clearing it.
     let dirty = PageSet::new(seq.region.n_pages());
     let mut prev = u64::MAX;
     for round in 1..=opts.max_rounds {
-        dirty.clear();
         seq.tracker.harvest(&dirty)?;
 
         let filled = seq.filled();
@@ -294,11 +318,24 @@ pub fn migrate_out(
         );
         let bytes = total_bytes(&runs);
         if bytes == 0 {
+            rep.stop_reason = "nothing left to send".into();
+            break;
+        }
+        // Decide *before* spending the round. If the sequence is dirtying pages
+        // at least as fast as the link ships them, another round costs its
+        // whole duration and leaves at least as much to do at the end of it;
+        // the residue only grows. Stop and take the pause.
+        if bytes >= prev {
+            rep.converged = false;
+            rep.stop_reason =
+                format!("round {round} would send {} after {}, no smaller -- link cannot outrun the sequence",
+                    fmt_bytes(bytes), fmt_bytes(prev));
             break;
         }
         let t0 = Instant::now();
         conn.send(&Msg::Pages { round, runs: runs.clone() })?;
         let sent = conn.send_page_bytes(&seq.region, &runs)?;
+        dirty.clear(); // these pages are now on the far side
         let now_tokens = tokens_at();
         rep.rounds.push(RoundStat {
             index: round,
@@ -312,14 +349,13 @@ pub fn migrate_out(
         low = clip.saturating_sub(1);
 
         if bytes <= opts.target_bytes {
-            break; // small enough to finish with the sequence stopped
-        }
-        if bytes >= prev {
-            // The sequence is dirtying pages at least as fast as we can ship
-            // them. More rounds would only delay the inevitable pause.
+            rep.stop_reason = format!("round fits in the {} budget", fmt_bytes(opts.target_bytes));
             break;
         }
         prev = bytes;
+        if round == opts.max_rounds {
+            rep.stop_reason = format!("round budget of {} used up", opts.max_rounds);
+        }
     }
     rep.precopy_ms = precopy_start.elapsed().as_secs_f64() * 1e3;
 
@@ -328,12 +364,27 @@ pub fn migrate_out(
     seq.pause();
     let t_parked = Instant::now();
     rep.park_us = (t_parked - t_req).as_secs_f64() * 1e6;
-    assert!(
-        seq.state.lock().unwrap().at_token_boundary(),
-        "decode loop parked somewhere a handover cannot describe"
-    );
 
-    dirty.clear();
+    // A long pre-copy can outlast the sequence. `pause` returns when the loop
+    // parks *or* when it finishes, and a finished sequence has nothing left to
+    // feed the destination, so there is nothing to hand over.
+    {
+        let st = seq.state.lock().unwrap();
+        if !st.can_hand_over() {
+            let why = if st.done {
+                format!("sequence finished ({}) while the pre-copy was running", st.done_reason)
+            } else {
+                "sequence is no longer in a handover-able state".to_string()
+            };
+            drop(st);
+            let _ = conn.send(&Msg::Error(why.clone()));
+            seq.resume();
+            let _ = seq.tracker.disarm();
+            return Err(io::Error::other(why));
+        }
+    }
+
+    // Not cleared: this unions with any round that was harvested but abandoned.
     seq.tracker.harvest(&dirty)?;
     let (tokens, prompt_len, filled, rng, cfg, max_tokens) = {
         let st = seq.state.lock().unwrap();
@@ -513,6 +564,17 @@ pub fn migrate_in(worker: &Arc<Worker>, mut conn: Conn) -> io::Result<()> {
             other => return Err(io::Error::other(format!("unexpected message: {other:?}"))),
         }
     };
+
+    if fin.filled as usize >= fin.tokens.len() {
+        // The source should never offer this; check anyway, because accepting
+        // it means a decode thread with nothing to feed it.
+        conn.send(&Msg::Error("handover has no token left to feed".into()))?;
+        return Err(io::Error::other(format!(
+            "refused handover: filled {} but only {} tokens",
+            fin.filled,
+            fin.tokens.len()
+        )));
+    }
 
     // ---- the stop-the-world window on this side starts here ----------------
     let t_resume = Instant::now();

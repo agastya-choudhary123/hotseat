@@ -51,15 +51,24 @@ pub struct SeqState {
     /// that creating it is not part of the stop-the-world window; it waits here
     /// until the handover completes.
     pub ready: bool,
+    /// Set by the decode thread as it returns. `done` only means "should
+    /// stop"; this means "has stopped", and reusing a worker's slot has to wait
+    /// for the second one, not the first.
+    pub exited: bool,
     pub log: Vec<TokenEvent>,
     /// Tokens decoded on this host (not counting any inherited from a source).
     pub decoded_here: usize,
 }
 
 impl SeqState {
-    /// The invariant the migration point relies on.
-    pub fn at_token_boundary(&self) -> bool {
-        self.done || self.filled < self.tokens.len()
+    /// Whether this sequence can be handed to another worker right now.
+    ///
+    /// It is not enough to be parked: a sequence that *finished* while the
+    /// pre-copy was running is parked too, and it has `filled == tokens.len()`,
+    /// which is precisely the state the decode loop's invariant excludes. There
+    /// is nothing left to feed it, so there is nothing to hand over.
+    pub fn can_hand_over(&self) -> bool {
+        !self.done && !self.migrated_away && self.filled < self.tokens.len()
     }
 }
 
@@ -117,6 +126,7 @@ impl Seq {
                 pause_req: false,
                 paused: false,
                 ready: true,
+                exited: false,
                 log: Vec::new(),
                 decoded_here: 0,
             }),
@@ -163,6 +173,16 @@ impl Seq {
         self.cv.notify_all();
     }
 
+    /// End the sequence now, releasing the slot for another one.
+    pub fn stop(&self, reason: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.done = true;
+        st.done_reason = reason.to_string();
+        st.pause_req = false;
+        st.ready = true;
+        self.cv.notify_all();
+    }
+
     /// Abandon a sequence that was pre-spawned but never completed its
     /// handover, so its parked decode thread exits.
     pub fn abandon(&self) {
@@ -189,10 +209,25 @@ impl Seq {
             st = self.cv.wait(st).unwrap();
         }
     }
+
+    /// Wait until the decode thread has actually left the loop.
+    pub fn wait_exited(&self) {
+        let mut st = self.state.lock().unwrap();
+        while !st.exited {
+            st = self.cv.wait(st).unwrap();
+        }
+    }
 }
 
 /// Run the sequence to completion, or until it is handed to another worker.
 pub fn decode_loop(seq: Arc<Seq>) {
+    run(&seq);
+    let mut st = seq.state.lock().unwrap();
+    st.exited = true;
+    seq.cv.notify_all();
+}
+
+fn run(seq: &Arc<Seq>) {
     let kv = seq.kv();
     let mut scratch = seq.model.scratch();
     let eos = seq.model.tok.eos;
@@ -220,7 +255,15 @@ pub fn decode_loop(seq: Arc<Seq>) {
                 seq.cv.notify_all();
                 return;
             }
-            debug_assert!(st.filled < st.tokens.len(), "loop invariant broken");
+            if st.filled >= st.tokens.len() {
+                // Unreachable if the invariant holds. Ending the sequence
+                // rather than indexing past the end means a bug upstream costs
+                // a bad transcript, not a dead worker.
+                st.done = true;
+                st.done_reason = "internal: nothing to feed at the token boundary".into();
+                seq.cv.notify_all();
+                return;
+            }
             (st.tokens[st.filled], st.filled)
         };
 

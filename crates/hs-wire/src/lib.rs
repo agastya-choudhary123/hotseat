@@ -205,6 +205,16 @@ pub enum Msg {
 pub struct Conn {
     pub sock: TcpStream,
     pub peer: String,
+    /// Optional send rate for bulk page data, in bytes per second.
+    ///
+    /// Loopback and a single Docker bridge both move a KV cache faster than a
+    /// sequence can dirty it, so pre-copy converges in one or two rounds and
+    /// the algorithm never has to show its work. Shaping the link is how the
+    /// round table becomes a measurement of convergence rather than a
+    /// demonstration that the cache is small.
+    rate: Option<f64>,
+    paced_start: Option<std::time::Instant>,
+    paced_bytes: u64,
 }
 
 impl Conn {
@@ -214,7 +224,18 @@ impl Conn {
         // the stop-the-world window. Nagle would add up to 40 ms to it.
         sock.set_nodelay(true)?;
         let peer = sock.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
-        Ok(Conn { sock, peer })
+        Ok(Conn { sock, peer, rate: None, paced_start: None, paced_bytes: 0 })
+    }
+
+    /// Limit bulk page transfer to `mbps` megabits per second. Control frames
+    /// are never paced -- they are latency, not bandwidth, and pacing them
+    /// would be measuring the shaper instead of the protocol.
+    pub fn set_rate_mbps(&mut self, mbps: f64) {
+        if mbps > 0.0 {
+            self.rate = Some(mbps * 1e6 / 8.0);
+            self.paced_start = Some(std::time::Instant::now());
+            self.paced_bytes = 0;
+        }
     }
 
     pub fn connect(addr: &str) -> io::Result<Conn> {
@@ -323,10 +344,33 @@ impl Conn {
             // what the tracker will report, and the round after this one
             // re-sends them.
             let bytes = unsafe { region.bytes(off as usize, len as usize) };
-            self.sock.write_all(bytes)?;
+            if self.rate.is_some() {
+                // 64 KiB at a time, so the shaper's granularity is well under a
+                // millisecond at any rate worth emulating.
+                for chunk in bytes.chunks(64 * 1024) {
+                    self.sock.write_all(chunk)?;
+                    self.pace(chunk.len() as u64);
+                }
+            } else {
+                self.sock.write_all(bytes)?;
+            }
             total += len;
         }
         Ok(total)
+    }
+
+    /// Sleep until the cumulative byte count is back under the target rate.
+    /// Cumulative rather than per-chunk, so a slow chunk does not permanently
+    /// lower the achieved rate.
+    fn pace(&mut self, n: u64) {
+        let Some(rate) = self.rate else { return };
+        let start = *self.paced_start.get_or_insert_with(std::time::Instant::now);
+        self.paced_bytes += n;
+        let due = self.paced_bytes as f64 / rate;
+        let elapsed = start.elapsed().as_secs_f64();
+        if due > elapsed {
+            std::thread::sleep(std::time::Duration::from_secs_f64(due - elapsed));
+        }
     }
 
     /// Read page bytes directly into `region`.
