@@ -79,7 +79,7 @@ flight when the migration asked to stop — that time is reported separately as
 | **Migration** | iterative pre-copy over raw TCP, convergence rules, stop-and-copy |
 | **Proof** | transcript equality against a never-migrated reference, with a control |
 | **Deployment** | two containers on a Docker network; macOS host to Linux container |
-| **Size** | ~4,900 lines of Rust, ~1,100 of tests |
+| **Size** | ~6,800 lines of Rust, ~1,150 of tests |
 
 The only dependency in the whole workspace is `libc`. The tokenizer, the
 transcendentals, the hashes, the wire format, the thread pool and every syscall
@@ -466,7 +466,7 @@ owning a registry of regions.
 ## Building and testing
 
 ```bash
-cargo test --release            # 71 tests
+cargo test --release            # 72 tests
 HS_TRACKER=signal cargo test --release -p hs-track   # same suite, other backend
 
 # what tracking costs, on this machine
