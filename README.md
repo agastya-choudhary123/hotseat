@@ -90,7 +90,29 @@ holds it.
 
 ```bash
 cargo build --release
+```
 
+The GGUF weights are not in this repo. Both demo models are stock quantizations
+from Hugging Face — fetch them into `models/` before running anything:
+
+```bash
+mkdir -p models
+huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+    qwen2.5-0.5b-instruct-q4_k_m.gguf --local-dir models
+huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct-GGUF \
+    qwen2.5-1.5b-instruct-q4_k_m.gguf --local-dir models
+
+# the commands below use the shorter names
+mv models/qwen2.5-0.5b-instruct-q4_k_m.gguf models/qwen2.5-0.5b-instruct-q4km.gguf
+mv models/qwen2.5-1.5b-instruct-q4_k_m.gguf models/qwen2.5-1.5b-instruct-q4km.gguf
+```
+
+Any GGUF llama.cpp can load will work; the 0.5B is just the fastest thing to
+iterate on. Both workers in a migration must be given the byte-identical file —
+a handover replays cache positions against the model's own weights, so two
+different quantizations of the same model will diverge rather than fail loudly.
+
+```bash
 # two workers, same model file, on one machine
 ./target/release/hs-worker --model models/qwen2.5-0.5b-instruct-q4km.gguf \
     --listen 127.0.0.1:7401 --name A &

@@ -1,4 +1,11 @@
 target/
+
+# GGUF weights — see README for download instructions
 models/*.gguf
-*.mig
+
+# local benchmark output
 runs/
+*.mig
+
+.claude/
+.DS_Store
