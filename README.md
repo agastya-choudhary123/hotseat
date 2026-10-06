@@ -1,19 +1,17 @@
-hotseat
--------
+# hotseat
 
-hotseat moves a running LLM request between machines without stopping it. A
-decoding sequence is frozen on one worker, its KV cache, sampler state and
-random stream are shipped to another, and it resumes there mid-sentence and
-finishes the token stream it started, producing bit-for-bit the tokens it would
-have produced had it never moved.
+Live migration for LLM inference. hotseat can move a sequence that is
+generating tokens from one machine to another while it keeps running. The
+KV cache, sampler state, and RNG state all move with it, and the destination
+produces exactly the tokens the source would have produced if the sequence
+had never moved.
 
-The transfer is not the hard part. The sequence keeps decoding while the
-transfer happens, which requires the machine to tell you which pages of the
-cache changed under you: on macOS, write-protecting the cache and catching
-`EXC_BAD_ACCESS` on a Mach exception port; on Linux, `mprotect` and a `SIGSEGV`
-handler. Then iterative pre-copy rounds and a short stop-and-copy at the end.
-It is the algorithm live VM migration has used for twenty years, applied to
-something nobody applies it to.
+It uses the same approach as live VM migration. The cache pages are copied
+over in rounds while decoding continues, and the OS reports which pages were
+written in the meantime. On macOS that's done by write-protecting the cache
+and catching `EXC_BAD_ACCESS`; on Linux it's `mprotect` and `SIGSEGV`. When
+the remaining dirty set is small enough, decoding stops briefly and the rest
+is sent.
 
 ```
 $ hotseat a:7400 start max=120 temp=0.8 seed=99 "Explain why a cache is faster than main memory."
@@ -31,212 +29,183 @@ stop-the-world 473.0 us  (park 12035.0 us, send 7.00 KiB in 89.7 us, destination
 live cache 2.51 MiB | kv hash src 0x0913b2b2fd071270 dst 0x0913b2b2fd071270 (verified on destination)
 ```
 
-`hs-a` decoded 72 tokens, `hs-b` decoded the other 48, and the paragraph reads
-as one paragraph.
+`libc` is the only dependency. The inference engine, tokenizer, math
+functions, hashing, wire format, thread pool, and syscall bindings are all in
+this repo, about 7,400 lines of Rust. Design notes and bug write-ups are in
+[NOTES.md](NOTES.md).
 
-The only dependency in the workspace is `libc`. The tokenizer, transcendentals,
-hashes, wire format, thread pool and every syscall binding are in this tree.
-About 6,800 lines of Rust and 1,150 of tests.
+## Quick start
 
-### Documentation quick links
+```sh
+cargo build --release
 
-* [Quick start](#quick-start)
-* [Benchmarks](#benchmarks)
-* [Dirty-page tracking](#dirty-page-tracking)
-* [Determinism](#determinism)
-* [Limitations](#limitations)
-* [NOTES.md](NOTES.md) — design decisions, the epoch protocol, and the hardest bugs
-
-### Quick start
-
-```
-$ cargo build --release
+mkdir -p models
+huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+    qwen2.5-0.5b-instruct-q4_k_m.gguf --local-dir models
+# the scripts expect this name
+mv models/qwen2.5-0.5b-instruct-q4_k_m.gguf models/qwen2.5-0.5b-instruct-q4km.gguf
 ```
 
-The GGUF weights are not in this repo. Both demo models are stock quantizations
-from Hugging Face:
-
-```
-$ mkdir -p models
-$ huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct-GGUF \
-      qwen2.5-0.5b-instruct-q4_k_m.gguf --local-dir models
-$ mv models/qwen2.5-0.5b-instruct-q4_k_m.gguf models/qwen2.5-0.5b-instruct-q4km.gguf
-```
-
-Any GGUF llama.cpp can load will work. Both workers in a migration must be given
-the byte-identical file: a handover replays cache positions against the model's
-own weights, so two different quantizations of the same model diverge rather
-than failing loudly. The handshake refuses the transfer if the fingerprints
-differ.
+Both workers need the exact same GGUF file. Two different quantizations of
+the same model would silently produce different tokens, so the handshake
+compares fingerprints and refuses if they don't match.
 
 Two workers on one machine:
 
-```
-$ ./target/release/hs-worker --model models/qwen2.5-0.5b-instruct-q4km.gguf \
-      --listen 127.0.0.1:7401 --name A &
-$ ./target/release/hs-worker --model models/qwen2.5-0.5b-instruct-q4km.gguf \
-      --listen 127.0.0.1:7402 --name B &
+```sh
+W=./target/release/hs-worker
+H=./target/release/hotseat
+M=models/qwen2.5-0.5b-instruct-q4km.gguf
 
-$ H=./target/release/hotseat
-$ $H 127.0.0.1:7401 start max=120 temp=0.8 seed=99 "Write a paragraph about virtual memory."
-$ $H 127.0.0.1:7401 migrate 127.0.0.1:7402 at=60 verify
-$ $H 127.0.0.1:7402 wait
-```
+$W --model $M --listen 127.0.0.1:7401 --name A &
+$W --model $M --listen 127.0.0.1:7402 --name B &
 
-`at=60` pins the handover to an exact cache position instead of racing it with a
-sleep, which is what makes the determinism tests repeatable.
-
-Four scripts run the whole story:
-
-```
-$ scripts/verify-determinism.sh   # transcripts identical at five migration points
-$ scripts/demo-precopy.sh         # pre-copy across four shaped link rates
-$ scripts/demo-containers.sh      # container to container
-$ scripts/demo-crosshost.sh       # macOS host -> Linux container
+$H 127.0.0.1:7401 start max=120 temp=0.8 seed=99 "Write a paragraph about virtual memory."
+$H 127.0.0.1:7401 migrate 127.0.0.1:7402 at=60 verify
+$H 127.0.0.1:7402 wait
 ```
 
-### Benchmarks
+`migrate` options:
 
-Apple M4, 16 GB, Qwen2.5-0.5B-Instruct Q4_K_M, 24 KiB of KV per token.
+- `at=N` hands over at exactly cache position N, which keeps the tests
+  repeatable.
+- `rounds=N` and `target=BYTES` set the pre-copy limits.
+- `mbps=N` throttles the transfer.
+- `verify` re-hashes the KV cache on the destination.
+- `norng` leaves out the RNG state. This is a control for the determinism
+  test.
+
+The scripts in `scripts/`:
+
+```sh
+scripts/verify-determinism.sh   # migrate at five positions, compare transcripts
+scripts/demo-precopy.sh         # pre-copy at four throttled link rates
+scripts/demo-containers.sh      # container to container
+scripts/demo-crosshost.sh       # macOS host to a Linux container
+```
+
+## How a handover works
+
+The decode loop keeps one invariant: at the start of each iteration,
+`filled < tokens.len()`. Here `filled` is the number of positions in the KV
+cache, and `tokens` is the prompt plus everything generated so far. That
+means there's always at least one token that has been chosen but not yet run
+through the model. A sequence paused at that point has no logits or partial
+layer state to save. The destination just feeds `tokens[filled]` at position
+`filled` and keeps going.
+
+So a handover is the cache pages, the token list, the sampler config, and
+four words of RNG state. The invariant holds during prefill too, so a
+sequence can even move in the middle of its prompt.
+
+```
+source                                             destination
+  |-- Hello: fingerprint, cache shape, page size -->|
+  |<-- HelloAck -----------------------------------| allocate cache, start
+  | arm dirty tracking                              | decode thread (parked)
+  |-- round 0: all live pages --------------------->|
+  |     ...decoding continues...                    |
+  |-- round k: pages dirtied during round k-1 ----->|
+  | park decode loop             <-- window opens   |
+  |-- remaining pages + tokens + sampler + RNG ---->|
+  |                                                 | unpark
+  |<-- ResumeAck ----------------  window closes    |
+```
+
+The destination's decode thread is created during pre-copy. I measured thread
+spawn at anywhere from 48 to 943 µs, and I didn't want that inside the pause.
+
+## Benchmarks
+
+Measured on an Apple M4 with 16 GB, Qwen2.5-0.5B-Instruct Q4_K_M (24 KiB of
+KV per token):
 
 | | |
 |---|---|
-| Stop-the-world window, loopback | 174 – 330 µs |
-| Stop-the-world, container to container | 473 µs |
-| Residual bytes moved with the sequence stopped | ~5 – 20 KiB |
+| Pause, loopback | 174–330 µs |
+| Pause, container to container | 473 µs |
+| Data sent while paused | ~5–20 KiB |
 | Dirty-page fault, `mprotect` + signal (macOS / Linux) | 3.10 µs / 1.24 µs |
 | Dirty-page fault, Mach exception port (macOS) | 13.0 µs |
-| Write to a page already dirty this round | 6.4 ns |
-| Transcript after a handover | token-identical to a run that never moved |
+| Write to a page that's already dirty | 6.4 ns |
 
-The window is measured from the instant the decode loop parks to the instant the
-destination says it is running. It excludes the tail of the token in flight when
-the migration asked to stop; that is reported separately as `park`, because the
-sequence was still producing during it.
+The pause runs from the moment the decode loop parks until the destination
+reports it's running. Finishing the token that was in progress is reported
+separately as `park`.
 
-Engine correctness against llama.cpp, same files, same 256-token windows, same
-second-half scoring:
+Perplexity compared with llama.cpp, using the same files and 256-token
+windows:
 
-| model | hotseat | llama.cpp | delta |
+| model | hotseat | llama.cpp | diff |
 |---|---|---|---|
 | Qwen2.5-0.5B-Instruct Q4_K_M | 18.140 | 18.113 | +0.15% |
 | Qwen2.5-1.5B-Instruct Q4_K_M | 12.486 | 12.487 | −0.01% |
 
-The residual is deliberate: weights are dequantised to f16 at load rather than
-kept quantised. A quantised dot product would be faster per byte, but the
-subject here is migration, and f16 gives one numeric path that is identical
-everywhere, so "the token stream survives the boundary" is a claim about the
-migration rather than about two matmul kernels agreeing.
+The small gap is because hotseat dequantizes the weights to f16 at load time.
+That's slower than quantized matmuls, but it gives the same numeric path on
+every machine, which is what this project cares about.
 
-#### Pre-copy
+### Pre-copy
 
-Loopback moves a KV cache far faster than a sequence can dirty it, so rounds
-converge immediately and the algorithm never shows its work. `migrate ...
-mbps=N` shapes the bulk transfer so they do. Same sequence, 563-token prompt,
-~7 MiB live cache:
+On loopback the copy is so much faster than decoding dirties pages that
+pre-copy finishes in one round. With `mbps=N` throttling, you can see how
+it behaves on slower links. This run uses a 563-token prompt and about 7 MiB
+of live cache:
 
-| link | rounds | round sizes | stop-the-world |
+| link | rounds | round sizes | pause |
 |---|---|---|---|
 | 1000 Mbit/s | 2 | 7.05 MiB → 96 KiB | 0.97 ms |
 | 200 Mbit/s | 2 | 7.05 MiB → 480 KiB | 1.11 ms |
 | 60 Mbit/s | 3 | 7.08 MiB → 1.34 MiB → 312 KiB | 8.3 ms |
-| 10 Mbit/s | 2, aborted | 7.05 MiB → 8.77 MiB → would be 9.84 MiB | 8.25 s |
+| 10 Mbit/s | 2, gave up | 7.05 MiB → 8.77 MiB → (9.84 MiB) | 8.25 s |
 
-Each round carries what the sequence dirtied while the previous one was in
-flight, so the ratio between consecutive rounds is (dirty rate / link rate). At
-60 Mbit/s that is about 0.19 and three rounds suffice. At 10 Mbit/s it is above
-1, the rounds grow, and no number of them converges:
+Each round sends whatever was dirtied during the previous round, so the
+rounds shrink by roughly (dirty rate / link rate). At 10 Mbit/s that ratio is
+above 1 and the rounds grow instead. hotseat notices before it sends a round
+that wouldn't be smaller, and switches to stop-and-copy:
 
 ```
 rounds stopped: round 2 would send 9.84 MiB after 8.77 MiB, no smaller
                 -- link cannot outrun the sequence [DID NOT CONVERGE]
 ```
 
-The rule fires before spending the round, because a round that will not shrink
-costs its whole duration and leaves at least as much to do afterwards. The
-8.25-second pause that follows is the honest answer: at 10 Mbit/s a sequence
-generating 1.4 MB/s of KV cannot be migrated live, and pretending otherwise
-only makes the pause longer.
+## Dirty-page tracking
 
-### How a handover works
+There are four backends. The same test suite runs against each one:
+`HS_TRACKER=signal cargo test`.
 
-The decode loop maintains one invariant and the whole design rests on it: at the
-top of every iteration, `filled < tokens.len()`. `filled` is how many positions
-are in the KV cache and `tokens` is the prompt plus everything generated, so
-there is always at least one token that has been decided but not yet run through
-the model. A sequence paused there needs no logits, no half-finished layer state
-and no in-flight anything. Feed `tokens[filled]` at position `filled` and carry
-on.
+| backend | mechanism |
+|---|---|
+| `mach-vm-protect` | `mach_vm_protect` + `EXC_BAD_ACCESS` on a Mach exception port |
+| `mprotect-signal` | `mprotect` + `SIGSEGV`/`SIGBUS`, handled on the faulting thread |
+| `uffd-wp` | `userfaultfd` write-protect |
+| `soft-dirty` | `clear_refs` + `pagemap` bit 55 (cost is a scan of the whole region) |
 
-So a handover is the pages, the token list, the sampler configuration and four
-words of RNG state: a few kilobytes plus the cache. Because the invariant holds
-during prefill exactly as during generation, a sequence can be handed over in
-the middle of its prompt, and the determinism suite does that on purpose.
-
-```
-source                                             destination
-  |-- Hello: fingerprint, cache shape, page size -->|
-  |<-- HelloAck ---------------------------------- | allocate cache,
-  | arm dirty tracking                              | start decode thread
-  |-- round 0: everything live right now ---------->| (parked on `ready`)
-  |     ...decode continues throughout...           |
-  |-- round k: only what changed since round k-1 -->|
-  | park the decode loop        <--- window opens   |
-  |-- residue + tokens + sampler + RNG ------------>|
-  |                                                 | fill in state, unpark
-  |<-- ResumeAck ---------------  window closes     | decode resumes here
-```
-
-Two things are deliberately outside the window. The destination's decode thread
-is created during pre-copy and parks on a flag, because spawning a thread was
-measured at 48 µs on a good day and 943 µs on a bad one. And the destination's
-KV hash check is off unless asked for, because re-hashing a live cache costs
-real microseconds; `verify` turns it on.
-
-### Dirty-page tracking
-
-Four backends, one acceptance suite. `HS_TRACKER=signal cargo test` runs the
-whole suite against a chosen one, because a table of mechanisms is a claim and a
-table of mechanisms that all pass the same tests is a result.
-
-| backend | mechanism | cost model |
-|---|---|---|
-| `mach-vm-protect` | `mach_vm_protect` + `EXC_BAD_ACCESS` on a Mach exception port | per first write to a page |
-| `mprotect-signal` | `mprotect` + `SIGSEGV`/`SIGBUS`, handled on the faulting thread | per first write to a page |
-| `uffd-wp` | `userfaultfd` write-protect mode | per first write to a page |
-| `soft-dirty` | `clear_refs` + `pagemap` bit 55 | per scan, proportional to region size |
-
-Measured on a 112 MiB region, median of five runs:
+On a 112 MiB region (median of 5 runs):
 
 | | macOS, 16 KiB pages | Linux container, 4 KiB pages |
 |---|---|---|
-| `mach-vm-protect`, per fault | 13.0 µs | — |
-| `mprotect-signal`, per fault | 3.10 µs | 1.24 µs |
-| of which inside our handler | 0.35 µs | 0.60 µs |
+| `mach-vm-protect` per fault | 13.0 µs | — |
+| `mprotect-signal` per fault | 3.10 µs | 1.24 µs |
+| ...of which in our handler | 0.35 µs | 0.60 µs |
 | write to an already-dirty page | 6.4 ns | — |
 | re-arm an untouched region | 0.2 µs | 0.6 µs |
-| re-arm after every page has faulted | 134 µs (7,168 pages) | 1,245 µs (28,672 pages) |
+| re-arm after every page faulted | 134 µs (7,168 pages) | 1,245 µs (28,672 pages) |
 
-Handling the fault on the faulting thread is 4x cheaper than messaging it to
-another one: the Mach path costs two `mach_msg` round trips and a context
-switch, the signal path costs a trap and a return.
+The signal path costs a trap and a return. The Mach path costs two
+`mach_msg` round trips and a context switch, which is why it's about 4x
+slower.
 
-Re-arming is not free once the mapping is fragmented. Every per-page permission
-change splits a VM map entry, so the bulk `mprotect` that starts a round goes
-from 0.2 µs to 134 µs after 7,168 individual faults. That is the argument for
-`--cluster`: unprotecting N pages per fault trades a coarser dirty set for fewer
-faults and a less shredded map. At cluster 8 the macOS backend moves 760k
-pages/s instead of 222k.
+Re-arming gets expensive after many faults, because each per-page permission
+change splits a VM map entry. `--cluster N` unprotects N pages per fault,
+which gives a coarser dirty set but fewer faults and fewer map entries. At
+cluster 8, the macOS backend handles 760k pages/s instead of 222k.
 
-Not writing costs nothing and neither does writing twice. 6.4 ns is a plain
-store, so tracking is expensive only at the boundary between clean and dirty,
-which is exactly the property pre-copy needs.
+## Determinism
 
-### Determinism
-
-`scripts/verify-determinism.sh` runs a reference sequence start to finish on one
-worker, then re-runs it handing over at five pinned positions, one of them
-inside the prompt, and once as an A→B→A→B round trip:
+`scripts/verify-determinism.sh` runs a reference sequence on one worker. Then
+it reruns the sequence with a handover at five fixed positions (one of them
+inside the prompt) and once as an A→B→A→B round trip:
 
 ```
 PASS  migrate at position 12   identical transcript   (stop-the-world 219.5 us)
@@ -250,17 +219,17 @@ control: hand over the KV cache but not the sampler state
 PASS  transcripts diverge as they must (first 43 tokens shared, then they part)
 ```
 
-The control is the point. `migrate ... norng` transfers everything except the
-sampler state; the KV hashes still match, the handover still succeeds, and the
-transcripts come apart. A determinism test that cannot fail is not a test.
+The control run (`norng`) moves everything except the RNG state. The KV
+hashes still match, but the transcripts diverge, which shows the test can
+actually catch a broken handover.
 
-Three things had to be true to get here: one accumulation order everywhere, no
-libm, and a sampler RNG that actually moves. [NOTES.md](NOTES.md) explains each.
+Getting identical output took three things: the same accumulation order
+everywhere, no libm, and moving the sampler RNG. NOTES.md covers each one.
 
-### Cross-OS and containers
+### Across OSes
 
-`scripts/demo-crosshost.sh` moves a sequence from a native macOS worker into a
-Linux container:
+`scripts/demo-crosshost.sh` moves a sequence from macOS into a Linux
+container:
 
 ```
   macos-host       macos/aarch64  16384 B pages  mach-vm-protect
@@ -269,51 +238,49 @@ Linux container:
 PASS  identical token stream across macOS -> Linux container
 ```
 
-Different OS, page size, dirty-tracking mechanism and C library, and the same
-tokens, with the destination's own hash matching the source's. Page size never
-enters the protocol: the tracker's unit is a page, but the transfer's unit is a
-byte range, so a 16 KiB-page sender and a 4 KiB-page receiver need no
-translation.
+Page size doesn't matter to the protocol, because transfers are byte ranges
+rather than pages.
 
-`scripts/demo-containers.sh` puts two workers on a Docker network with the model
-mounted read-only, on `mincontainer`'s dev image. Weights are never migrated and
-never should be. Note that Docker Desktop's LinuxKit kernel has both
-`CONFIG_USERFAULTFD` and `CONFIG_MEM_SOFT_DIRTY` off, and the soft-dirty failure
-is silent; see [NOTES.md](NOTES.md).
+`scripts/demo-containers.sh` runs two workers on a Docker network, using
+[mincontainer](https://github.com/agastya-choudhary123/mincontainer)'s dev
+image with the model mounted read-only. Docker Desktop's LinuxKit kernel has
+both `CONFIG_USERFAULTFD` and `CONFIG_MEM_SOFT_DIRTY` turned off, and
+soft-dirty fails silently there (see NOTES.md).
 
-### Limitations
+## Limitations
 
-One sequence per worker. Not a protocol limit: the macOS tracker is
-process-wide, so supporting several means one tracker owning several regions and
-dispatching faults by address. The signal backend already works that way.
+- One sequence per worker. The macOS tracker is process-wide, so supporting
+  more would mean dispatching faults by address. The signal backend already
+  does that.
+- No batching, including during prefill. This keeps prefill and decode on the
+  same code path, but it makes prefill slow.
+- No post-copy. When pre-copy can't converge, you get a long pause.
+- `uffd-wp` is written but hasn't been tested, because I haven't had a kernel
+  with `CONFIG_USERFAULTFD` enabled.
+- Only the Qwen2 architecture is supported. The loader handles
+  F32/F16/Q4_K/Q5_K/Q5_0/Q6_K/Q8_0.
+- The KV hash catches corruption and divergence. It isn't meant to stop an
+  attacker.
 
-No batching, one token at a time, prefill included. That is deliberate, so
-prefill and decode dirty the cache through the identical code path and the
-migration numbers describe one mechanism rather than two. It also makes prefill
-slow.
+## Tests and benchmarks
 
-Post-copy is not implemented. When pre-copy cannot converge the honest options
-are a long pause, which is what this does, or demand-paging the cache from the
-source after the switch. The second is the better answer and the tracking
-machinery is most of what it needs.
+```sh
+cargo test --release                                   # 72 tests
+HS_TRACKER=signal cargo test --release -p hs-track     # same suite, other backend
 
-`uffd-wp` is written but untested on real hardware, because no kernel available
-here has `CONFIG_USERFAULTFD` on. It passes review, not tests.
+cargo run --release -p hs-track --example faultbench -- 112 mach
+cargo run --release -p hs-track --example faultbench -- 112 signal
 
-Qwen2 only. The loader handles F32/F16/Q4_K/Q5_K/Q5_0/Q6_K/Q8_0, but the forward
-pass is one architecture.
+cargo run --release -p hs-engine --example ppl -- models/<model>.gguf bench/ppl.txt 256
+llama-perplexity -m models/<model>.gguf -f bench/ppl.txt --ctx-size 256
+```
 
-The hash detects corruption and divergence, not an adversary.
-
-### Building and testing
+## Layout
 
 ```
-$ cargo test --release                                 # 72 tests
-$ HS_TRACKER=signal cargo test --release -p hs-track   # same suite, other backend
-
-$ cargo run --release -p hs-track --example faultbench -- 112 mach
-$ cargo run --release -p hs-track --example faultbench -- 112 signal
-
-$ cargo run --release -p hs-engine --example ppl -- models/<model>.gguf bench/ppl.txt 256
-$ llama-perplexity -m models/<model>.gguf -f bench/ppl.txt --ctx-size 256
+crates/hs-engine   GGUF loader, Qwen2 forward pass, tokenizer, sampler, KV cache
+crates/hs-track    dirty-page tracking backends
+crates/hs-wire     wire format
+crates/hs-worker   the worker: decode loop, migration sender and receiver
+crates/hs-cli      `hotseat`, a thin client for the worker's text control protocol
 ```
